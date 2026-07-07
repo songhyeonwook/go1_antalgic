@@ -1,0 +1,191 @@
+#!/bin/bash
+# Phase 2 teacher: train peg-leg injury scenarios from the Phase 1 healthy baseline.
+#
+# Goal:
+#   Keep the default Go1 locomotion reward, add peg-leg randomization + pain,
+#   and warmstart from the clean Phase 1 baseline.
+#
+# Usage:
+#   ./train_phase2.sh
+#
+# Optional overrides:
+#   NUM_ENVS=4096 ./train_phase2.sh
+#   PHASE2_MAX_ITER=5000 ./train_phase2.sh
+#   PHASE1_CKPT=/path/to/model_5999.pt ./train_phase2.sh
+#   GO1_USE_PEG_LEG_CURRICULUM=0 ./train_phase2.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/train.py" ]; then
+    TRAIN_DIR="$SCRIPT_DIR"
+else
+    TRAIN_DIR="$SCRIPT_DIR/scripts/rsl_rl"
+fi
+
+TASK="${TASK:-Template-Go1-Lab-v0}"
+PHASE1_EXP_NAME="${PHASE1_EXP_NAME:-unitree_go1_rough_healthy}"
+PHASE1_RUN_NAME="${PHASE1_RUN_NAME:-phase1_go1_default_baseline}"
+EXP_NAME="${EXP_NAME:-unitree_go1_rough_teacher}"
+RUN_NAME="${PHASE2_RUN_NAME:-phase2_teacher_antalgic_v1}"
+NUM_ENVS="${NUM_ENVS:-8192}"
+SEED="${SEED:-42}"
+MAX_ITER="${PHASE2_MAX_ITER:-5000}"
+PHASE1_CKPT="${PHASE1_CKPT:-}"
+
+cd "$TRAIN_DIR"
+
+if [ -z "$PHASE1_CKPT" ]; then
+    PHASE1_EXP_CANDIDATES=("$PHASE1_EXP_NAME")
+    if [ "$PHASE1_EXP_NAME" != "unitree_go1_rough_healthy" ]; then
+        PHASE1_EXP_CANDIDATES+=("unitree_go1_rough_healthy")
+    fi
+
+    LATEST_PHASE1_RUN=""
+    SEARCHED_PHASE1_ROOTS=()
+    for PHASE1_EXP_CANDIDATE in "${PHASE1_EXP_CANDIDATES[@]}"; do
+        PHASE1_ROOT="$TRAIN_DIR/logs/rsl_rl/$PHASE1_EXP_CANDIDATE"
+        SEARCHED_PHASE1_ROOTS+=("$PHASE1_ROOT")
+        if [ ! -d "$PHASE1_ROOT" ]; then
+            continue
+        fi
+        LATEST_PHASE1_RUN="$(find "$PHASE1_ROOT" -maxdepth 1 -type d -name "*_${PHASE1_RUN_NAME}" | sort | tail -n 1 || true)"
+        if [ -n "$LATEST_PHASE1_RUN" ]; then
+            break
+        fi
+    done
+
+    if [ -z "$LATEST_PHASE1_RUN" ]; then
+        echo "ERROR: Phase 1 run not found."
+        echo "       searched roots:"
+        printf '       - %s\n' "${SEARCHED_PHASE1_ROOTS[@]}"
+        echo "       expected suffix: $PHASE1_RUN_NAME"
+        echo "       override with: PHASE1_CKPT=/path/to/model_N.pt ./train_phase2.sh"
+        exit 1
+    fi
+
+    PHASE1_CKPT="$(
+        find "$LATEST_PHASE1_RUN" -maxdepth 1 -type f -name 'model_*.pt' \
+            | awk -F'[_/.]' '{ print $(NF-1) "\t" $0 }' \
+            | sort -n \
+            | tail -n 1 \
+            | cut -f2-
+    )"
+fi
+
+# GO1_NO_WARMSTART=1 → train the teacher FROM SCRATCH (no healthy warmstart), so a
+# broken-trot / asymmetric injured gait can EMERGE instead of being trapped in the
+# symmetric-trot basin of a healthy warmstart (needed for rear-leg gait emergence).
+WS_ARGS=(--warmstart_ckpt_path "$PHASE1_CKPT")
+if [ "${GO1_NO_WARMSTART:-0}" = "1" ]; then
+    WS_ARGS=()
+    PHASE1_CKPT="(none: from scratch)"
+elif [ ! -f "$PHASE1_CKPT" ]; then
+    echo "ERROR: Phase 1 checkpoint not found: $PHASE1_CKPT"
+    exit 1
+fi
+
+echo "-----------------------------------------------"
+echo "  Phase 2: peg-leg teacher antalgic training"
+echo "  run_name=$RUN_NAME"
+echo "  warmstart=$PHASE1_CKPT"
+echo "  num_envs=$NUM_ENVS max_iterations=$MAX_ITER seed=$SEED"
+echo "  peg_leg_prob=${GO1_PROB_PEG_LEG:-0.5}"
+echo "  splint_range=[${GO1_SPLINT_LENGTH_MIN:-0.20}, ${GO1_SPLINT_LENGTH_MAX:-0.30}] m"
+echo "  pain_weight=${GO1_PAIN_WEIGHT:--0.08} threshold=${GO1_PAIN_THRESHOLD_N:-12.0}N scale=${GO1_PAIN_SCALE:-0.15}"
+echo "  pain_base_contact=${GO1_PAIN_BASE_CONTACT_COST:-2.0} load_contact=${GO1_PAIN_LOAD_CONTACT_COST:-0.0}@${GO1_LOAD_CONTACT_THRESHOLD_N:-10.0}N"
+echo "  intact_overload_weight=${GO1_INTACT_OVERLOAD_WEIGHT:-0.0} threshold=${GO1_INTACT_OVERLOAD_THRESHOLD_N:-65.0}N"
+echo "  injured_force_nonuse=${GO1_INJURED_FORCE_NONUSE_WEIGHT:-0.0} duty_nonuse=${GO1_INJURED_DUTY_NONUSE_WEIGHT:-0.0} duty_overuse=${GO1_INJURED_DUTY_OVERUSE_WEIGHT:-0.0}"
+echo "  normal_symmetry force=${GO1_CONTACT_FORCE_ASYM_WEIGHT:--0.012} duty=${GO1_DUTY_FACTOR_ASYM_WEIGHT:--0.04} diagonal=${GO1_DIAGONAL_LOAD_ASYM_WEIGHT:--0.006} front_rear=${GO1_FRONT_REAR_LOAD_DIST_WEIGHT:--0.0025}"
+echo "  curriculum=${GO1_USE_PEG_LEG_CURRICULUM:-1}"
+echo "  extra gait tuning=${GO1_PHASE2_GAIT_TUNING:-0}"
+echo "-----------------------------------------------"
+
+GO1_PHASE=teacher \
+GO1_EVAL_MODE=random \
+GO1_PHASE1_BALANCE_REWARDS=0 \
+GO1_PHASE2_GAIT_TUNING="${GO1_PHASE2_GAIT_TUNING:-0}" \
+GO1_PROB_PEG_LEG="${GO1_PROB_PEG_LEG:-0.5}" \
+GO1_SPLINT_LENGTH_MIN="${GO1_SPLINT_LENGTH_MIN:-0.20}" \
+GO1_SPLINT_LENGTH_MAX="${GO1_SPLINT_LENGTH_MAX:-0.30}" \
+GO1_FOOT_FRICTION_MIN="${GO1_FOOT_FRICTION_MIN:-0.4}" \
+GO1_FOOT_FRICTION_MAX="${GO1_FOOT_FRICTION_MAX:-1.0}" \
+GO1_USE_PEG_LEG_CURRICULUM="${GO1_USE_PEG_LEG_CURRICULUM:-1}" \
+GO1_CURRICULUM_PROB_START="${GO1_CURRICULUM_PROB_START:-0.1}" \
+GO1_CURRICULUM_PROB_RAMP_STEPS="${GO1_CURRICULUM_PROB_RAMP_STEPS:-5000}" \
+GO1_CURRICULUM_SPLINT_LO_START="${GO1_CURRICULUM_SPLINT_LO_START:-0.28}" \
+GO1_CURRICULUM_SPLINT_HI_START="${GO1_CURRICULUM_SPLINT_HI_START:-0.33}" \
+GO1_CURRICULUM_SPLINT_RAMP_STEPS="${GO1_CURRICULUM_SPLINT_RAMP_STEPS:-8000}" \
+GO1_PAIN_WEIGHT="${GO1_PAIN_WEIGHT:--0.08}" \
+GO1_PAIN_THRESHOLD_N="${GO1_PAIN_THRESHOLD_N:-12.0}" \
+GO1_PAIN_SCALE="${GO1_PAIN_SCALE:-0.15}" \
+GO1_PAIN_OVERLOAD_TOLERANCE="${GO1_PAIN_OVERLOAD_TOLERANCE:-0.0}" \
+GO1_PAIN_MAX_EXP_ARGUMENT="${GO1_PAIN_MAX_EXP_ARGUMENT:-6.0}" \
+GO1_PAIN_MAX_PENALTY="${GO1_PAIN_MAX_PENALTY:-20.0}" \
+GO1_PAIN_BASE_CONTACT_COST="${GO1_PAIN_BASE_CONTACT_COST:-2.0}" \
+GO1_PAIN_LOAD_CONTACT_COST="${GO1_PAIN_LOAD_CONTACT_COST:-0.0}" \
+GO1_PAIN_LOAD_COST_SEVERE_MULT="${GO1_PAIN_LOAD_COST_SEVERE_MULT:-1.20}" \
+GO1_PAIN_LOAD_COST_MILD_MULT="${GO1_PAIN_LOAD_COST_MILD_MULT:-0.80}" \
+GO1_PAIN_INCLUDE_CALF="${GO1_PAIN_INCLUDE_CALF:-1}" \
+GO1_PAIN_SEVERITY_SCALING="${GO1_PAIN_SEVERITY_SCALING:-0}" \
+GO1_PAIN_THRESHOLD_SEVERE_MULT="${GO1_PAIN_THRESHOLD_SEVERE_MULT:-0.80}" \
+GO1_PAIN_THRESHOLD_MILD_MULT="${GO1_PAIN_THRESHOLD_MILD_MULT:-1.15}" \
+GO1_PAIN_SCALE_SEVERE_MULT="${GO1_PAIN_SCALE_SEVERE_MULT:-1.25}" \
+GO1_PAIN_SCALE_MILD_MULT="${GO1_PAIN_SCALE_MILD_MULT:-0.85}" \
+GO1_INTACT_OVERLOAD_WEIGHT="${GO1_INTACT_OVERLOAD_WEIGHT:-0.0}" \
+GO1_INTACT_OVERLOAD_THRESHOLD_N="${GO1_INTACT_OVERLOAD_THRESHOLD_N:-65.0}" \
+GO1_INTACT_OVERLOAD_SCALE="${GO1_INTACT_OVERLOAD_SCALE:-1.0}" \
+GO1_INTACT_OVERLOAD_MAX_PENALTY="${GO1_INTACT_OVERLOAD_MAX_PENALTY:-120.0}" \
+GO1_INJURED_FORCE_NONUSE_WEIGHT="${GO1_INJURED_FORCE_NONUSE_WEIGHT:-0.0}" \
+GO1_INJURED_DUTY_NONUSE_WEIGHT="${GO1_INJURED_DUTY_NONUSE_WEIGHT:-0.0}" \
+GO1_INJURED_DUTY_OVERUSE_WEIGHT="${GO1_INJURED_DUTY_OVERUSE_WEIGHT:-0.0}" \
+GO1_INJURED_NONUSE_EMA_ALPHA="${GO1_INJURED_NONUSE_EMA_ALPHA:-0.995}" \
+GO1_INJURED_NONUSE_RAMP_STEPS="${GO1_INJURED_NONUSE_RAMP_STEPS:-8000}" \
+GO1_INJURED_OVERUSE_RAMP_STEPS="${GO1_INJURED_OVERUSE_RAMP_STEPS:-8000}" \
+GO1_INJURED_MIN_FORCE_SEVERE_N="${GO1_INJURED_MIN_FORCE_SEVERE_N:-2.0}" \
+GO1_INJURED_MIN_FORCE_MILD_N="${GO1_INJURED_MIN_FORCE_MILD_N:-11.0}" \
+GO1_INJURED_MIN_FORCE_FRONT_MULT="${GO1_INJURED_MIN_FORCE_FRONT_MULT:-1.15}" \
+GO1_INJURED_MIN_FORCE_REAR_MULT="${GO1_INJURED_MIN_FORCE_REAR_MULT:-1.0}" \
+GO1_LOAD_CONTACT_THRESHOLD_N="${GO1_LOAD_CONTACT_THRESHOLD_N:-10.0}" \
+GO1_INJURED_MIN_DUTY_SEVERE="${GO1_INJURED_MIN_DUTY_SEVERE:-0.05}" \
+GO1_INJURED_MIN_DUTY_MILD="${GO1_INJURED_MIN_DUTY_MILD:-0.28}" \
+GO1_INJURED_MIN_DUTY_FRONT_MULT="${GO1_INJURED_MIN_DUTY_FRONT_MULT:-1.10}" \
+GO1_INJURED_MIN_DUTY_REAR_MULT="${GO1_INJURED_MIN_DUTY_REAR_MULT:-1.0}" \
+GO1_INJURED_MAX_DUTY_SEVERE="${GO1_INJURED_MAX_DUTY_SEVERE:-0.30}" \
+GO1_INJURED_MAX_DUTY_MILD="${GO1_INJURED_MAX_DUTY_MILD:-0.50}" \
+GO1_INJURED_MAX_DUTY_FRONT_MULT="${GO1_INJURED_MAX_DUTY_FRONT_MULT:-0.95}" \
+GO1_INJURED_MAX_DUTY_REAR_MULT="${GO1_INJURED_MAX_DUTY_REAR_MULT:-1.0}" \
+GO1_INJURED_LIGHT_DRAG_WEIGHT="${GO1_INJURED_LIGHT_DRAG_WEIGHT:-0.0}" \
+GO1_CONTACT_FORCE_ASYM_WEIGHT="${GO1_CONTACT_FORCE_ASYM_WEIGHT:--0.012}" \
+GO1_CONTACT_FORCE_ASYM_RAMP_STEPS="${GO1_CONTACT_FORCE_ASYM_RAMP_STEPS:-6000}" \
+GO1_DUTY_FACTOR_ASYM_WEIGHT="${GO1_DUTY_FACTOR_ASYM_WEIGHT:--0.04}" \
+GO1_DUTY_FACTOR_ASYM_RAMP_STEPS="${GO1_DUTY_FACTOR_ASYM_RAMP_STEPS:-6000}" \
+GO1_DIAGONAL_LOAD_ASYM_WEIGHT="${GO1_DIAGONAL_LOAD_ASYM_WEIGHT:--0.006}" \
+GO1_DIAGONAL_LOAD_ASYM_RAMP_STEPS="${GO1_DIAGONAL_LOAD_ASYM_RAMP_STEPS:-6000}" \
+GO1_TROT_SYNC_WEIGHT="${GO1_TROT_SYNC_WEIGHT:-0.12}" \
+GO1_TROT_SYNC_RAMP_STEPS="${GO1_TROT_SYNC_RAMP_STEPS:-6000}" \
+GO1_FRONT_REAR_LOAD_DIST_WEIGHT="${GO1_FRONT_REAR_LOAD_DIST_WEIGHT:--0.0025}" \
+GO1_FRONT_REAR_LOAD_DIST_RAMP_STEPS="${GO1_FRONT_REAR_LOAD_DIST_RAMP_STEPS:-6000}" \
+GO1_FRONT_LOAD_TARGET_FRACTION="${GO1_FRONT_LOAD_TARGET_FRACTION:-0.55}" \
+GO1_FRONT_LOAD_TARGET_TOLERANCE="${GO1_FRONT_LOAD_TARGET_TOLERANCE:-0.06}" \
+GO1_BASE_HEIGHT_WEIGHT="${GO1_BASE_HEIGHT_WEIGHT:-0.0}" \
+GO1_SURVIVAL_BONUS_WEIGHT="${GO1_SURVIVAL_BONUS_WEIGHT:-0.0}" \
+GO1_FRONT_PAYLOAD_KG="${GO1_FRONT_PAYLOAD_KG:-0.0}" \
+GO1_FRONT_COM_X_M="${GO1_FRONT_COM_X_M:-0.0}" \
+python3 train.py \
+    --task "$TASK" \
+    --agent "${AGENT:-rsl_rl_teacher_cfg_entry_point}" \
+    --num_envs "$NUM_ENVS" \
+    --headless \
+    --experiment_name "$EXP_NAME" \
+    --run_name "$RUN_NAME" \
+    "${WS_ARGS[@]}" \
+    --max_iterations "$MAX_ITER" \
+    --seed "$SEED" \
+    --use_peg_leg_action_mask
+
+echo ""
+echo "-----------------------------------------------"
+echo "  Phase 2 complete"
+echo "  Logs: $TRAIN_DIR/logs/rsl_rl/$EXP_NAME"
+echo "-----------------------------------------------"

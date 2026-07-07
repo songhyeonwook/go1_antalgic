@@ -1,0 +1,28 @@
+# training artifacts / data (not part of the algorithm)
+logs/
+outputs/
+runs/
+biomech/
+pd_logs/
+*.npz
+*.pt
+*.onnx
+*.jit
+wandb/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg-link
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
