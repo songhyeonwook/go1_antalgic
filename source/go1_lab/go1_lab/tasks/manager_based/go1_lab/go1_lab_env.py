@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Go1 Lab 환경 - ActuatorNetMLP 호환 Peg-Leg Action Masking."""
+"""Go1 Lab 환경 - explicit actuator 호환 Peg-Leg Action Masking."""
 
 from __future__ import annotations
 
@@ -19,14 +19,13 @@ from .go1_lab_env_cfg import Go1LabEnvCfg
 class Go1LabEnv(ManagerBasedRLEnv):
     """Go1 Lab 환경 (ManagerBasedRLEnv 확장).
 
-    ⚠️ ActuatorNetMLP 호환을 위한 핵심 오버라이드:
-      Go1은 Explicit Actuator(ActuatorNetMLP)를 사용하므로,
-      joint_stiffness로는 관절을 고정할 수 없습니다.
-      
-      대신 step()을 오버라이드하여:
-        (1) process_action() 전에 부상 calf joint의 action을 0으로 마스킹
-        (2) physics sub-step마다 joint_pos/vel을 lock angle로 강제
-      이 두 가지를 통해 관절을 물리적으로 고정합니다.
+    step()을 오버라이드하여 부목(peg-leg) 고정을 구현합니다:
+      (1) process_action() 전에 부상 calf joint의 action을 0으로 마스킹
+          (last_action 관측 일관성 확보용 — 고정 자체는 (2)가 담당)
+      (2) 매 physics sub-step에서 apply_action() 직후 부상 calf의
+          joint_pos_target 을 lock angle 로 덮어쓰기 → PD 가 오차를 보고 붙잡음.
+    리셋 시 초기 배치는 randomize_peg_leg_actuation 이 write_joint_state_to_sim
+    으로 수행합니다.
     """
 
     cfg: Go1LabEnvCfg
@@ -35,7 +34,8 @@ class Go1LabEnv(ManagerBasedRLEnv):
         """환경 step - 부상 다리 action masking 후 물리 시뮬레이션 수행."""
 
         # ━━━ (1) Action Masking: physics loop 전에 부상 calf action을 0으로 강제 ━━━
-        action = self._mask_peg_leg_action(action)
+        if self.cfg.use_peg_leg_action_mask:
+            action = self._mask_peg_leg_action(action)
 
         # process actions (masked)
         self.action_manager.process_action(action.to(self.device))
@@ -60,8 +60,6 @@ class Go1LabEnv(ManagerBasedRLEnv):
                 self.sim.render()
             # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
-            # ⭐ physics 후에도 joint_pos/vel을 강제하여 다음 sub-step에서 올바른 상태로 시작
-            self._enforce_peg_leg_joint_state()
 
         # post-step: 나머지는 부모 클래스와 동일
         self.episode_length_buf += 1
@@ -72,10 +70,9 @@ class Go1LabEnv(ManagerBasedRLEnv):
 
         # ⭐ Grace Period: 부상 환경은 처음 10스텝 동안 높이 종료 비활성화
         # 다리가 짧아진 직후 정책이 적응할 시간을 줍니다.
-        grace_steps = int(os.getenv("GO1_PEG_GRACE_STEPS", "10"))
         if hasattr(self, "_peg_leg_index"):
             is_injured = self._peg_leg_index >= 0
-            in_grace = self.episode_length_buf <= grace_steps
+            in_grace = self.episode_length_buf <= self.cfg.grace_steps
             grace_mask = is_injured & in_grace
             if grace_mask.any():
                 # time_out은 유지하되, terminated(높이/접촉 등)만 억제
@@ -110,8 +107,10 @@ class Go1LabEnv(ManagerBasedRLEnv):
     def _mask_peg_leg_action(self, action: torch.Tensor) -> torch.Tensor:
         """부상 calf joint의 action을 0으로 마스킹합니다.
 
-        action=0이면 target = default_pos + 0 * scale = lock_angle이 되어,
-        ActuatorNetMLP가 관절을 현재 위치(lock_angle)에 유지하는 토크를 출력합니다.
+        주 목적은 last_action 관측 일관성입니다 (고정 관절의 action 은 항상 0).
+        주의: action offset 은 액션 항 init 시 default_joint_pos 를 clone 한 값이라
+        action=0 이 lock 목표를 만들지는 않습니다 — 실제 고정은
+        _enforce_peg_leg_joint_targets 의 target 덮어쓰기 + PD 가 담당합니다.
         """
         if not hasattr(self, "_peg_leg_index"):
             return action
@@ -127,20 +126,24 @@ class Go1LabEnv(ManagerBasedRLEnv):
         # NOT per-leg, so the calf action index is NOT leg_idx*3+2 — that froze a
         # DIFFERENT leg's joint (e.g. an RL injury masked FL_calf, killing a front
         # leg → the robot could not walk). Use the real calf joint index (resolved
-        # by name in events.py), matching _enforce_peg_leg_joint_targets/_state.
+        # by name in events.py), matching _enforce_peg_leg_joint_targets.
         if hasattr(self, "_peg_leg_calf_joint_index"):
             calf_action_idx = self._peg_leg_calf_joint_index[injured_envs]
             valid = calf_action_idx >= 0
             action[injured_envs[valid], calf_action_idx[valid]] = 0.0
-        else:
-            action[injured_envs, peg_idx[injured_envs] * 3 + 2] = 0.0
+        # else: 이름 기반 인덱스가 없으면 마스킹을 건너뜁니다. per-leg 공식
+        # (leg*3+2) 은 per-TYPE 순서에서 엉뚱한 healthy 관절을 죽이므로, 잘못된
+        # 마스킹보다 no-op 가 안전합니다 (_ensure_peg_leg_buffers 이후에는 항상 존재).
         return action
 
     def _enforce_peg_leg_joint_targets(self) -> None:
-        """apply_action() 후, write_data_to_sim() 전에 joint target을 강제합니다.
+        """apply_action() 후, write_data_to_sim() 전에 부상 calf 의 target 을 lock angle 로 강제합니다.
 
-        action masking으로 target ≈ lock_angle이지만,
-        혹시라도 action_manager가 다른 값을 설정했을 경우를 대비합니다.
+        이것이 부목 고정의 주 경로입니다: PD 가 target 오차를 보고 관절을 붙잡습니다.
+        ⚠️ 측정값(robot.data.joint_pos/joint_vel)에 대입하는 방식은 금지 — 그 버퍼는
+        PhysX 읽기 캐시라 sim 에 전달되지 않고, 액추에이터가 바로 그 캐시로 PD 오차를
+        계산하므로 스푸핑되어 홀딩 토크가 0 이 됩니다 (실측: 부상 calf 0.00 Nm vs
+        정상 4.74 Nm, 관절이 lock 에서 평균 0.81 rad 이탈해 무릎이 접혔음).
         """
         if not hasattr(self, "_peg_leg_index"):
             return
@@ -158,27 +161,3 @@ class Go1LabEnv(ManagerBasedRLEnv):
         # joint_pos_target을 lock angle로 강제
         if hasattr(robot.data, "joint_pos_target") and robot.data.joint_pos_target.ndim >= 2:
             robot.data.joint_pos_target[injured_envs, calf_joints] = lock_angles
-
-    def _enforce_peg_leg_joint_state(self) -> None:
-        """physics step 후, joint_pos/vel을 lock angle/0으로 강제합니다.
-
-        ActuatorNetMLP는 완벽한 위치 추종을 보장하지 않으므로 (특히 외력이 작용할 때),
-        매 sub-step 후 관절 상태를 직접 강제하여 rigid lock을 시뮬레이션합니다.
-        """
-        if not hasattr(self, "_peg_leg_index"):
-            return
-
-        peg_idx = self._peg_leg_index
-        is_injured = peg_idx >= 0
-        if not is_injured.any():
-            return
-
-        robot = self.scene["robot"]
-        injured_envs = torch.where(is_injured)[0]
-        calf_joints = self._peg_leg_calf_joint_index[injured_envs]
-        lock_angles = self._peg_leg_calf_lock_angle[injured_envs]
-
-        if hasattr(robot.data, "joint_pos") and robot.data.joint_pos.ndim >= 2:
-            robot.data.joint_pos[injured_envs, calf_joints] = lock_angles
-        if hasattr(robot.data, "joint_vel") and robot.data.joint_vel.ndim >= 2:
-            robot.data.joint_vel[injured_envs, calf_joints] = 0.0

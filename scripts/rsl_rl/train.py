@@ -9,151 +9,143 @@
 
 import argparse
 import sys
-
+import traceback
 from isaaclab.app import AppLauncher
 
-# local imports
-import cli_args  # isort: skip
-from peg_leg_action_wrapper import PegLegActionMaskWrapper  # isort: skip
+# added
+from utils.config_builder import ExperimentConfig, load_experiment_config, read_yaml
+from pathlib import Path
+from utils.prettyjson import prettyjson
+import json
+from datetime import datetime
+from dataclasses import asdict
+from utils.logger import create_logger, StreamToLogger, redirect_python_streams
+import logging
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate (default: uses env config default, typically 4096).")
-parser.add_argument(
-    "--task",
-    type=str,
-    default="Template-Go1-Lab-v0",
-    help="Name of the task (default: Template-Go1-Lab-v0).",
-)
-parser.add_argument(
-    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
-)
-parser.add_argument(
-    "--teacher_ckpt_path",
-    type=str,
-    default=None,
-    help="Path to teacher checkpoint for distillation (optional).",
-)
-parser.add_argument(
-    "--warmstart_ckpt_path",
-    type=str,
-    default=None,
-    help=(
-        "Path to a checkpoint to warmstart the (OnPolicy) runner from, across "
-        "experiments. Typically used for Phase 2 Teacher to load Phase 1 "
-        "Healthy pretrain weights. Loaded only if --resume is not used and "
-        "agent is not distillation."
-    ),
-)
-parser.add_argument(
-    "--use_pretrained_checkpoint",
-    action="store_true",
-    default=False,
-    help="Warm-start OnPolicy training from an Isaac Lab published pretrained checkpoint.",
-)
-parser.add_argument(
-    "--pretrained_task",
-    type=str,
-    default=None,
-    help=(
-        "Task id used to resolve the Isaac Lab published checkpoint when "
-        "--use_pretrained_checkpoint is set. Defaults to --task."
-    ),
-)
-parser.add_argument(
-    "--teacher_experiment_name",
-    type=str,
-    default="unitree_go1_rough_teacher",
-    help="Teacher experiment folder under logs/rsl_rl used when --teacher_ckpt_path is not set.",
-)
-parser.add_argument(
-    "--teacher_load_run",
-    type=str,
-    default=None,
-    help="Teacher run folder regex/name used for checkpoint lookup.",
-)
-parser.add_argument(
-    "--teacher_checkpoint",
-    type=str,
-    default="model_.*.pt",
-    help="Teacher checkpoint regex/name used for checkpoint lookup.",
-)
-parser.add_argument(
-    "--min_action_std",
-    type=float,
-    default=1.0e-3,
-    help="Lower bound for action std to avoid invalid Normal distribution.",
-)
-parser.add_argument(
-    "--use_peg_leg_action_mask",
-    action="store_true",
-    default=False,
-    help="Enable peg-leg calf action masking wrapper.",
-)
-parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
-parser.add_argument(
-    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
-)
-parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
-# append RSL-RL cli arguments
-cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-args_cli, hydra_args = parser.parse_known_args()
 
-if args_cli.num_envs is not None and args_cli.num_envs > 32768:
-    raise ValueError(
-        f"--num_envs={args_cli.num_envs} is too large for a single-PC Isaac Lab run. "
-        "Use a value such as 4096, 6144, or 8192. "
-        "If this was meant to be 8192 or 4096, pass that value explicitly."
+def rsl_rl_version_check():
+    # check minimum supported rsl-rl version
+    RSL_RL_VERSION = "3.0.1"
+    installed_version = metadata.version("rsl-rl-lib")
+    if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
+        if platform.system() == "Windows":
+            cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+        else:
+            cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+        print(
+            f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
+            f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
+            f"\n\n\t{' '.join(cmd)}\n"
+        )
+        exit(1)
+
+def set_log(log_dir, log_config_path, run_name):
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_configs = read_yaml(log_config_path)
+
+    app_logger = create_logger(
+        name=run_name,
+        log_directory=str(log_dir),
+        log_cfgs=log_configs,
     )
 
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
 
-# clear out sys.argv for Hydra
-sys.argv = [sys.argv[0]] + hydra_args
+    sys.stdout = StreamToLogger(
+        app_logger,
+        logging.INFO,
+        original_stdout,
+    )
 
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
+    sys.stderr = StreamToLogger(
+        app_logger,
+        logging.WARNING,
+        original_stderr,
+    )
+    
+    return app_logger
+    
+"""
+python3 train.py --phase 1 --run_tag P1-004
+"""
+
+current_file = Path(__file__).resolve().parent
+
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+parser.add_argument("--phase", type=int, choices=[1, 2, 3], required=True, help="Training phase: 1, 2, or 3.") 
+parser.add_argument("--common_config_path", type=str, required=False, default=f"{current_file}/configs/common.yaml", help="Path to YAML log config")
+parser.add_argument("--log_config_path", type=str, required=False, default=f"{current_file}/configs/logger.yaml" ,help="Path to YAML log config") 
+parser.add_argument("--run_tag", type=str, default="", help="실험 구분 이름. 예: z1_air050")
+AppLauncher.add_app_launcher_args(parser)
+
+# argparse가 아는 인자와 Hydra 인자를 분리
+args, hydra_args = parser.parse_known_args()
+# Hydra가 argparse용 인자를 다시 읽지 않도록 Hydra 인자만 남김
+sys.argv = [
+    sys.argv[0],
+    *hydra_args,
+    "hydra/job_logging=none", 
+    "hydra.output_subdir=null",
+    "hydra.run.dir=.",
+]
+
+phase_config_path = (
+    current_file / "configs" / "phase" / f"phase{args.phase}.yaml"
+)
+
+
+config = load_experiment_config(
+    phase_path=phase_config_path,
+    common_path=args.common_config_path    
+)
+
+timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
+run_tag = args.run_tag.strip()
+tag_suffix = f"_{run_tag}" if run_tag else ""
+run_name = f"{timestamp}_{config.phase}_s{config.train.seed}{tag_suffix}"
+
+log_dir = (
+    current_file
+    / "logs"
+    / config.train.project_name
+    / run_name
+)
+
+app_logger = set_log(log_dir, args.log_config_path, run_name)
+
+
+config_snapshot = asdict(config)
+config_snapshot["runtime"] = {
+    "run_name": run_name,
+    "run_tag": run_tag,
+    "phase_config_path": str(phase_config_path),
+    "log_dir": str(log_dir),
+    "cli_args": vars(args).copy(),
+}
+
+
+with (log_dir / "config.json").open("w", encoding="utf-8") as file:
+    json.dump(config_snapshot, file, indent=4, default=str)
+    
+app_logger.info(
+    "Training configuration:\n%s",
+    prettyjson(config_snapshot),
+)
+app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-"""Check for minimum supported RSL-RL version."""
+redirect_python_streams(app_logger)
 
+# Isaac Sim 실행 이후 import
 import importlib.metadata as metadata
 import platform
 
-from packaging import version
-
-# check minimum supported rsl-rl version
-RSL_RL_VERSION = "3.0.1"
-installed_version = metadata.version("rsl-rl-lib")
-if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
-    if platform.system() == "Windows":
-        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    else:
-        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    print(
-        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
-        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
-        f"\n\n\t{' '.join(cmd)}\n"
-    )
-    exit(1)
-
-"""Rest everything follows."""
-
 import gymnasium as gym
-import os
 import torch
-from datetime import datetime
 from torch.distributions import Normal
-
-import omni
+from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -163,232 +155,344 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
-from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
-from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-
-import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+import isaaclab_tasks  # noqa: F401
 import go1_lab.tasks  # noqa: F401
+
+from peg_leg_action_wrapper import PegLegActionMaskWrapper
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
+# check minimum supported rsl-rl version
+rsl_rl_version_check()
 
-def _inject_action_std_safety(policy, min_action_std: float) -> None:
-    """Clamp action std to keep Normal distribution valid."""
+def inject_action_std_safety(policy, min_action_std: float) -> None:
+    """Action 표준편차가 YAML의 하한보다 작아지지 않게 한다."""
+
     if not hasattr(policy, "update_distribution"):
         return
 
-    original_update_distribution = policy.update_distribution
+    min_action_std = float(min_action_std)
+
+    if min_action_std <= 0.0:
+        raise ValueError(
+            "min_action_std must be greater than zero, "
+            f"got {min_action_std}"
+        )
+
+    original_update_distribution = (policy.update_distribution)
 
     def safe_update_distribution(obs):
-        original_update_distribution(obs)
-        if not hasattr(policy, "distribution") or policy.distribution is None:
-            return
-
-        mean = policy.distribution.mean
-        std = policy.distribution.stddev
-        std = torch.nan_to_num(std, nan=float(min_action_std), posinf=1.0, neginf=float(min_action_std))
-        std = torch.clamp(std, min=float(min_action_std))
-        policy.distribution = Normal(mean, std)
-
+        # scalar 방식에서는 원래 distribution을 만들기 전에
+        # std 파라미터를 먼저 양수로 보정
         with torch.no_grad():
             if hasattr(policy, "std"):
                 policy.std.data = torch.nan_to_num(
                     policy.std.data,
-                    nan=float(min_action_std),
+                    nan=min_action_std,
                     posinf=1.0,
-                    neginf=float(min_action_std),
+                    neginf=min_action_std,
                 )
-                policy.std.data.clamp_(min=float(min_action_std))
+                policy.std.data.clamp_(
+                    min=min_action_std
+                )
+
             if hasattr(policy, "log_std"):
-                min_log_std = float(torch.log(torch.tensor(float(min_action_std))).item())
+                min_log_std = torch.log(
+                    torch.tensor(
+                        min_action_std,
+                        device=policy.log_std.device,
+                    )
+                ).item()
+
                 policy.log_std.data = torch.nan_to_num(
                     policy.log_std.data,
                     nan=min_log_std,
                     posinf=0.0,
                     neginf=min_log_std,
                 )
-                policy.log_std.data.clamp_(min=min_log_std)
+                policy.log_std.data.clamp_(
+                    min=min_log_std
+                )
 
-    policy.update_distribution = safe_update_distribution
+        # RSL-RL이 Normal distribution 생성
+        original_update_distribution(obs)
 
+        if (
+            not hasattr(policy, "distribution")
+            or policy.distribution is None
+        ):
+            return
 
-@hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Train with RSL-RL agent."""
-    # override configurations with non-hydra CLI arguments
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    agent_cfg.max_iterations = (
-        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
-    )
+        mean = policy.distribution.mean
+        std = policy.distribution.stddev
 
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
-    env_cfg.seed = agent_cfg.seed
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-
-    # multi-gpu training configuration
-    if args_cli.distributed:
-        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
-        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
-
-        # set seed to have diversity in different threads
-        seed = agent_cfg.seed + app_launcher.local_rank
-        env_cfg.seed = seed
-        agent_cfg.seed = seed
-
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
-    print(f"Exact experiment name requested from command line: {log_dir}")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
-
-    # set the IO descriptors export flag if requested
-    if isinstance(env_cfg, ManagerBasedRLEnvCfg):
-        env_cfg.export_io_descriptors = args_cli.export_io_descriptors
-    else:
-        omni.log.warn(
-            "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
+        safe_std = torch.nan_to_num(
+            std,
+            nan=min_action_std,
+            posinf=1.0,
+            neginf=min_action_std,
         )
 
-    # set the log directory for the environment (works for all environment types)
+        safe_std = torch.clamp(
+            safe_std,
+            min=min_action_std,
+        )
+
+        policy.distribution = Normal(
+            mean,
+            safe_std,
+        )
+
+    policy.update_distribution = (safe_update_distribution)
+    
+def update_agent_cfg(agent_cfg, config: ExperimentConfig, run_name: str):
+    train = config.train
+    
+    
+    agent_cfg.seed = train.seed
+    agent_cfg.logger = config.rsl_logger
+    # TensorBoard 로그 디렉터리와 RSL-RL 내부 run 이름을 동일하게 유지한다.
+    # 따라서 --run_tag가 두 위치에 모두 기록된다.
+    agent_cfg.run_name = run_name
+    agent_cfg.experiment_name = train.project_name
+    agent_cfg.max_iterations = train.max_iterations
+    
+    if config.phase in {"phase1", "phase2"}:
+        exploration = config.exploration
+        agent_cfg.policy.noise_std_type = (exploration.noise_std_type)
+        agent_cfg.policy.init_noise_std = (exploration.init_noise_std)
+
+    return agent_cfg
+    
+def update_env_cfg(env_cfg, config: ExperimentConfig, log_dir: str, steps_per_iteration: int):
+    train = config.train
+
+    steps_per_iteration = int(steps_per_iteration)
+    
+    env_cfg.scene.num_envs = train.num_envs
+    env_cfg.sim.device = config.common["device"]
+    env_cfg.seed = train.seed
     env_cfg.log_dir = log_dir
 
+    env_cfg.apply_environment_settings(
+        config.environment.values,
+        steps_per_iteration
+    )
+
+    return env_cfg
+
+def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
+    """RSL-RL 3.0.1+와의 설정 호환성을 위해 agent config를 수정한다.
+
+    처리 내용:
+    1. policy의 actor, critic, student, teacher 설정에 class_name이 없으면 기본값 "MLP"를 추가한다.
+    2. PPO 생성자가 지원하지 않는 algorithm 키를 제거한다.
+    """
+    policy_cfg = agent_cfg_dict.get("policy")
+
+    if isinstance(policy_cfg, dict):
+        policy_components = (
+            "actor",
+            "critic",
+            "student",
+            "teacher",
+        )
+
+        for component_name in policy_components:
+            component_cfg = policy_cfg.get(component_name)
+
+            if isinstance(component_cfg, dict):
+                component_cfg.setdefault(
+                    "class_name",
+                    "MLP",
+                )
+
+    algorithm_cfg = agent_cfg_dict.get("algorithm")
+
+    if isinstance(algorithm_cfg, dict):
+        unsupported_keys = (
+            "optimizer",
+            "config_class",
+            "share_cnn_encoders",
+        )
+
+        for key in unsupported_keys:
+            algorithm_cfg.pop(key, None)
+
+    return agent_cfg_dict    
+
+
+
+@hydra_task_config(
+    config.train.task,
+    config.train.agent,
+)
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+    train_cfg = config.train
+    checkpoint_cfg = config.checkpoint
+
+    # YAML 설정을 Hydra가 만든 설정 객체에 반영
+    agent_cfg = update_agent_cfg(agent_cfg, config, run_name)
+    
+    steps_per_iteration = int(agent_cfg.num_steps_per_env)
+    
+    env_cfg = update_env_cfg(env_cfg, config, str(log_dir), steps_per_iteration)
+
+    app_logger.info("Phase: %s", config.phase)
+    app_logger.info("Task: %s", train_cfg.task)
+    app_logger.info("Agent entry point: %s", train_cfg.agent)
+    app_logger.info("Number of environments: %d", env_cfg.scene.num_envs)
+    app_logger.info("Maximum iterations: %d", agent_cfg.max_iterations)
+    app_logger.info("Rollout steps per PPO iteration: %d", steps_per_iteration)
+    
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    env = gym.make(train_cfg.task, cfg=env_cfg, render_mode=None)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+    # # Phase 2, 3에서만 부상 action mask 적용
+    # if config.phase in ("phase2", "phase3"):
+    #     env = PegLegActionMaskWrapper(env)
 
-    resume_path = None
-    warmstart_path = None
-    teacher_resume_path = None
-    is_distillation = agent_cfg.class_name == "DistillationRunner"
+    # RSL-RL 환경 wrapper
+    env = RslRlVecEnvWrapper(env)
 
-    # Distillation에서는 teacher checkpoint를 기준으로 시작합니다.
-    # (RslRlBaseRunnerCfg 문서상 resume 플래그는 distillation에서 무시됨)
-    if is_distillation:
-        if args_cli.teacher_ckpt_path is not None:
-            teacher_resume_path = os.path.abspath(args_cli.teacher_ckpt_path)
-        else:
-            teacher_log_root = os.path.abspath(os.path.join("logs", "rsl_rl", args_cli.teacher_experiment_name))
-            teacher_resume_path = get_checkpoint_path(
-                teacher_log_root,
-                args_cli.teacher_load_run or ".*",
-                args_cli.teacher_checkpoint,
-            )
-    elif agent_cfg.resume:
-        # OnPolicyRunner인 경우에만 명시적 resume를 적용합니다.
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    elif args_cli.use_pretrained_checkpoint:
-        pretrained_task = args_cli.pretrained_task or args_cli.task
-        pretrained_task = pretrained_task.split(":")[-1].replace("-Play", "")
-        warmstart_path = get_published_pretrained_checkpoint("rsl_rl", pretrained_task)
-        if not warmstart_path:
-            raise FileNotFoundError(
-                "Isaac Lab published pretrained checkpoint is unavailable for "
-                f"task={pretrained_task!r}."
-            )
-    elif args_cli.warmstart_ckpt_path is not None:
-        # Cross-experiment warmstart (e.g. Phase1 Healthy → Phase2 Teacher).
-        warmstart_path = os.path.abspath(args_cli.warmstart_ckpt_path)
-
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # 필요할 때만 고장 다리 calf action masking 적용
-    enable_mask = args_cli.use_peg_leg_action_mask or bool(getattr(env_cfg, "use_peg_leg_action_mask", False))
-    if enable_mask:
-        env = PegLegActionMaskWrapper(env)
-
-    # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
-    # create runner from rsl-rl
+    # Agent config 변환
     agent_cfg_dict = agent_cfg.to_dict()
+    agent_cfg_dict = patch_rsl_rl_agent_cfg(agent_cfg_dict)
+    
+    # runner 생성
+    if config.phase in ("phase1", "phase2"):
+        runner = OnPolicyRunner(
+            env=env,
+            train_cfg=agent_cfg_dict,
+            log_dir=str(log_dir),
+            logger=app_logger,
+            device=agent_cfg.device,
+        )
 
-    # RSL-RL 3.0.1+ 버전 호환성을 위한 Patch
-    # 1. policy 구성 요소에 class_name 주입
-    if "policy" in agent_cfg_dict:
-        policy_cfg = agent_cfg_dict["policy"]
-        for component in ["actor", "critic", "student", "teacher"]:
-            if component in policy_cfg and isinstance(policy_cfg[component], dict):
-                if "class_name" not in policy_cfg[component]:
-                    # 기본값으로 MLP 설정 (Isaac Lab 표준)
-                    policy_cfg[component]["class_name"] = "MLP"
+    elif config.phase == "phase3":
+        runner = DistillationRunner(
+            env=env,
+            train_cfg=agent_cfg_dict,
+            log_dir=str(log_dir),
+            device=agent_cfg.device,
+        )
 
-    # 2. algorithm 설정에서 PPO 클래스가 지원하지 않는 키워드 제거
-    if "algorithm" in agent_cfg_dict:
-        alg_cfg = agent_cfg_dict["algorithm"]
-        # rsl-rl 3.0.1 PPO.__init__에서 제거된 키워드들 (버전 불일치 해결)
-        taboo_keys = ["optimizer", "config_class", "share_cnn_encoders"]
-        for taboo_key in taboo_keys:
-            if taboo_key in alg_cfg:
-                alg_cfg.pop(taboo_key)
-
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
     else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    # write git state to logs
-    runner.add_git_repo_to_log(__file__)
-    # load the checkpoint
-    if (not is_distillation) and agent_cfg.resume:
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
-    elif (not is_distillation) and warmstart_path is not None:
-        # Cross-experiment warmstart (optimizer/state 는 리셋, 가중치만 이식).
-        print(f"[INFO]: Warmstarting from checkpoint: {warmstart_path}")
-        runner.load(warmstart_path, load_optimizer=False)
-    elif is_distillation:
-        print(f"[INFO]: Loading teacher checkpoint for distillation from: {teacher_resume_path}")
-        # DistillationRunner는 teacher 파라미터가 먼저 로드되어야 학습을 시작할 수 있습니다.
-        runner.load(teacher_resume_path, load_optimizer=False)
+        raise ValueError(
+            f"Unsupported phase: {config.phase}"
+        )
 
-    # 학습 안정화: 분포 표준편차 하한 강제
-    _inject_action_std_safety(runner.alg.policy, min_action_std=args_cli.min_action_std)
+    # 체크포인트
+    mode = checkpoint_cfg.mode.strip().lower()
+    
 
-    # dump the configuration into log-directory
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    if mode == "scratch": # phase 2, phase 3 
+        pass
+    else:
+        if not checkpoint_cfg.teacher:
+            raise ValueError(
+                f"checkpoint.teacher is required "
+                f"when mode={mode!r}"
+            )
 
-    # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+        checkpoint_path = checkpoint_cfg.teacher.strip()
+        
+        runner.load(
+            checkpoint_path,
+            load_optimizer=checkpoint_cfg.load_optimizer,
+        )
 
-    # close the simulator
+        if mode == "resume":
+            restored_env_steps = int(runner.current_learning_iteration * steps_per_iteration)
+            env.unwrapped.common_step_counter = (restored_env_steps)
+            env.reset()
+            app_logger.info("Resumed iteration: %d",runner.current_learning_iteration,)
+            app_logger.info("Resumed environment step counter: %d", restored_env_steps,)
+        
+        elif checkpoint_cfg.reset_iteration:
+            runner.current_learning_iteration = 0
+                
+    
+        inject_action_std_safety(runner.alg.policy, min_action_std=(config.exploration.min_action_std),)
+
+        app_logger.info(
+            "PPO exploration: "
+            "type=%s, init_std=%g, min_std=%g, enforce=%s",
+            config.exploration.noise_std_type,
+            config.exploration.init_noise_std,
+            config.exploration.min_action_std,
+            config.exploration.enforce_min_std,
+        )
+            
+        
+    # 학습 시작
+    runner.learn(
+        num_learning_iterations=agent_cfg.max_iterations,
+        init_at_random_ep_len=True,
+    )
+
     env.close()
-
-
+    
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    main_error = None
+
+    try:
+        main()
+
+    except BaseException as error:
+        main_error = error
+        error_type = type(error).__name__
+
+        print(
+            f"\n[FATAL] main() terminated with {error_type}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+
+        app_logger.critical(
+            "main() terminated with %s: %s",
+            error_type,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+        raise
+
+    finally:
+        try:
+            app_logger.info("Closing Isaac Sim application.")
+            simulation_app.close()
+        except BaseException as close_error:
+            print(
+                (
+                    "\n[FATAL] simulation_app.close() failed with "
+                    f"{type(close_error).__name__}: {close_error}"
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+
+            app_logger.critical(
+                "simulation_app.close() failed with %s: %s",
+                type(close_error).__name__,
+                close_error,
+                exc_info=(
+                    type(close_error),
+                    close_error,
+                    close_error.__traceback__,
+                ),
+            )
+
+            # main()이 정상 종료된 경우에는 close 오류를 그대로 전파합니다.
+            # main() 예외가 이미 있으면 close 오류가 원래 예외를 덮지 않게 합니다.
+            if main_error is None:
+                raise

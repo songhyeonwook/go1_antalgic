@@ -5,33 +5,29 @@
 
 import gymnasium as gym
 
-from . import agents
+from . import agents # import go1_lab.tasks.manager_based.go1_lab.agents
 
 ##
 # Register Gym environments.
 ##
-
+# ~/wj/go1_antalgic/source/go1_lab/go1_lab/tasks/manager_based/go1_lab
+# 패키지 시작기준점: go1_lab/tasks/manager_based/go1_lab
 
 gym.register(
     id="Template-Go1-Lab-v0",
-    entry_point=f"{__name__}.go1_lab_env:Go1LabEnv",
+    entry_point=f"{__name__}.go1_lab_env:Go1LabEnv", # go1_lab.tasks.manager_based.go1_lab.go1_lab_env:Go1LabEnv -> class Go1LabEnv -> from go1_lab.tasks.manager_based.go1_lab.go1_lab_env import Go1LabEnv
     disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.go1_lab_env_cfg:Go1LabEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        "rsl_rl_symmetric_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyPPOLstmSymmetryRunnerCfg",
-        "rsl_rl_duty_refine_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyPPOLstmDutyRefineRunnerCfg",
-        "rsl_rl_trot_boost_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyPPOLstmTrotBoostRunnerCfg",
-        "rsl_rl_official_symmetric_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:OfficialGo1SymmetryRunnerCfg",
-        "rsl_rl_official_symmetric_refine_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:OfficialGo1SymmetryRefineRunnerCfg",
-        "rsl_rl_teacher_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TeacherRunnerCfg",
-        "rsl_rl_phase1_mirror_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyPPOLstmMirrorRunnerCfg",
-        "rsl_rl_teacher_mirror_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TeacherMirrorRunnerCfg",
-        "rsl_rl_phase1_mlp_symmetric_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyMlpSymmetryRunnerCfg",
-        "rsl_rl_phase1_mlp_symmetric_refine_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:HealthyMlpSymmetryRefineRunnerCfg",
-        "rsl_rl_teacher_mlp_symmetric_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TeacherMlpSymmetryRunnerCfg",
-        "rsl_rl_teacher_mlp_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TeacherMlpRunnerCfg",
-        "rsl_rl_distill_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DistillRunnerCfg",
+    kwargs={ # 환경설정 클래스
+        "env_cfg_entry_point": f"{__name__}.go1_lab_env_cfg:Go1LabEnvCfg", 
+        
+        # 학습 설정 클래스 from go1_lab.tasks.manager_based.go1_lab.agents.rsl_rl_ppo_cfg import PPORunnerCfg       
+        #"rsl_rl_teacher_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:TeacherRunnerCfg", # phase 1 + phase2 사용
+        #"rsl_rl_distill_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DistillRunnerCfg", # phase 3 사용
+
+        # 수정할 놈임
+        "rsl_rl_phase1_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Phase1HealthyRunnerCfg",
+        "rsl_rl_phase2_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Phase2InjuryRunnerCfg",
+        "rsl_rl_phase3_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DistillRunnerCfg"
     },
 )
 

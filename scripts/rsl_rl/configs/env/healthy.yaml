@@ -1,0 +1,228 @@
+name: healthy
+use_peg_leg_action_mask: false
+
+
+peg_leg:
+  enabled: false
+  grace_steps: 10
+
+  # Phase 1은 모든 환경을 정상 상태로 유지
+  prob_peg_leg: 0.0 # 부상을 적용할 확률
+  target_leg: env_fixed # 부상이 적용되었다면 어느 다리를 선택할지 결정
+
+  # 부상이 선택됐을 때 적용할 설정
+  prob_joint_disabled: 1.0 # 부상 다리가 선택됐을 때 해당 다리의 calf 관절을 실제로 고정할 확률
+  actuation_mode: locked
+
+  splint_length_range: [0.20, 0.30] # 부목 길이 균등분포 파라미터
+  foot_friction_range: [0.5, 1.5] # 부상 발에 사용할 마찰계수 샘플 범위
+
+  curriculum:
+    enabled: true
+
+    # 부상 다리 확률
+    leg_probability:
+      initial: 0.1
+      final: 0.5
+      iterations: 5000 # 증가 함수
+
+    # 부목 길이 확률
+    splint_length:
+      # 초기 부목범위
+      initial_min: 0.28
+      initial_max: 0.33
+
+      # 후기학습시 부목 범위
+      final_min: 0.20
+      final_max: 0.30
+
+      iterations: 8000
+
+# 로봇 Actuator 설정
+actuator:
+  type: pd
+
+  pd:
+    kp: 20.0                        # 관절 목표 위치 추종 강도
+    kd: 0.5                         # 관절 진동 및 급격한 움직임 감쇠
+    effort_limit: 23.7              # 최대 관절 토크 [N·m]
+    velocity_limit: 30.0            # 최대 관절 속도 [rad/s]
+    friction: 0.0                   # actuator 내부 마찰
+
+# 시뮬레이션 및 지형
+simulation:
+  # PhysX 환경 복제 설정
+  replicate_physics: false        # ContactSensor 초기화 문제 방지
+  clone_in_fabric: false          # 물리 복제 최적화 비활성화
+
+  # GPU PhysX 접촉 버퍼
+  gpu:
+    gpu_total_aggregate_pairs_capacity: 8388608   # 2^23, 대규모 병렬 환경 접촉 버퍼
+    gpu_found_lost_pairs_capacity: 8388608        # 2^23
+
+  # 지형 형상
+  terrain:
+    flat: true                      # true이면 plane, false이면 rough terrain
+    
+    curriculum:
+      terrain_levels: null
+
+  contact_compliance:
+    enabled: false                # 접촉을 부드럽게 만들지 여부
+    stiffness: 0.0                # 0이면 비활성화
+    damping: 2000.0
+
+# 속도 명령 범위
+command:
+  linear_velocity_x:
+    min: 0.10                     # 전진 최소 속도 [m/s]
+    max: 1.0                    # 전진 최대 속도 [m/s]
+
+  linear_velocity_y_abs: 0.0      # 좌우 속도 범위 [-값, +값]
+  angular_velocity_yaw_abs: 0.15  # 회전 속도 범위 [-값, +값]
+
+
+# Observation 설정
+observation:
+  history_length: 1              # 현재 observation만 사용
+  use_height_scan: false         # proprioception_only였는데 이름 변경 자기 상태 정보만 사용
+
+  use_calf_pos_nominal_rel: true
+
+  # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
+  # privileged observation group 자체는 유지
+  privileged: 
+    enabled: true 
+
+# Domain Randomization OK
+domain_randomization:
+  enabled: true                   # Sim-to-Real 강건성을 위한 DR 사용 여부
+
+  # 바닥과 발 사이의 미끄러움 변경
+  ground_friction:
+    enabled: true
+    static_range: [0.5, 1.5]      # 정지 마찰계수 범위 발이 바닥에서 아직 미끄러지지 않고 버티고 있을 때의 마찰
+    dynamic_range: [0.4, 1.2]     # 운동 마찰계수 범위
+ 
+  # 로봇의 몸통 질량을 환경마다 무작위로 변경
+  robot_mass:
+    enabled: true
+    body_name: "trunk"
+    scale_range: [0.85, 1.15]     # nominal 질량의 85~115%
+
+  # 로봇 몸통에 외란을 가하는 설정
+  random_push:
+    enabled: true
+    interval_range_s: [8.0, 12.0] # 미는시간
+    velocity_x_range: [-0.5, 0.5] # x
+    velocity_y_range: [-0.5, 0.5] # y
+
+  observation_noise:
+    enabled: true
+    joint_pos_std: 0.02
+    joint_vel_std: 0.02
+    base_ang_vel_std: 0.05
+    projected_gravity_std: 0.05
+    base_lin_vel_std: 0.05
+
+# 전방 Payload 및 CoM 설정 OK
+payload:
+  enabled: false
+  front_payload_kg: 0.0           # trunk에 추가할 질량 [kg]
+  front_com_x_m: 0.0              # CoM 전방 이동량 [m]
+  front_com_z_m: 0.0              # CoM 수직 이동량 [m]
+
+reward:
+  task: # 로봇이 명령을 제대로 수행
+    enabled: true
+    track_linear_velocity_weight: 2.5 # 전후, 좌우 속도를 얼마나 잘 따라가는지 보상
+    track_angular_velocity_weight: 0.75 # 명령받은 회전속도를 얼마나 잘 따라가는지 보상
+    linear_velocity_z_weight: -2.0 # 몸이 위 아래로 빠르게 흔들리면 주는 패널티
+  
+  gait_tuning: # 보행 모양과 부드러움을 조정
+    enabled: true
+    # GO1_FEET_AIR_TIME_WEIGHT
+    feet_air_time_weight: 0.25 # 발이 지면에서 떨어져 공중에 머무르는 시간을 보상 # 0.25 -> 0.5
+
+    # 적용 전 값. 이후 action_rate_penalty_scale=0.5가 곱해져
+    # 실제 최종 weight는 -0.025가 됨
+    action_rate_weight: -0.05 # 연속된 두 시점의 action 변화량을 벌점
+    angular_velocity_xy_weight: -0.1 # 몸통의 roll축과 pitch축 각속도를 억제하기 위한 벌점
+
+  energy:    
+    # 이미 Isaac Lab에 존재하는 페널티의 가중치를 배율로 조정
+    # ex # Isaac Lab 기본 -0.0002 × 30 = 실제 최종 -0.006
+    torque_penalty_scale: 30 # 관절 토크가 클수록 페널티가 커짐
+
+    # Isaac Lab 기본 -2.5e-7 × 0.5 = 실제 최종 -1.25e-7
+    dof_acc_penalty_scale: 0.5 # 관절 가속도 페널티
+
+    # gait_tuning의 -0.05 × 0.5 = 실제 최종 -0.025
+    action_rate_penalty_scale: 0.5 # final action rate weight = action_rate_weight *action_rate_penalty_scale 
+
+  posture:
+    flat_orientation_weight: -2.0 # 몸통이 수평에서 벗어나는 것을 벌점
+    base_height_target: 0.27 # 로봇 몸통이 유지해야 할 목표 높이 (목표값임 보상아님)
+    base_height_weight: -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
+
+  calf_contact:
+    enabled: false
+
+  # alive bonus
+  survival_bonus:
+    enabled: true
+    weight: 1.0 # 로봇이 종료되지 않고 한 step을 버틸 때마다 주는 생존 보상
+
+
+  joint_mirror_symmetry:
+    enabled: false
+    weight: -2.0
+  symmetric: # 네 다리를 균형 있게 사용하도록 유도하는 보상 모음
+    enabled: false
+
+    contact_force_asymmetry: # 패널티에 해당함으로
+      weight: 0.0 # 음수로 줘야함
+      ramp_duration_steps: 6000
+
+    duty_factor_asymmetry:
+      weight: 0.0
+      contact_threshold: 1.0
+      ramp_duration_steps: 6000
+
+    diagonal_load_asymmetry:
+      weight: 0.0
+      ramp_duration_steps: 6000
+
+    front_rear_load_distribution:
+      weight: 0.0
+      target_front_fraction: 0.55
+      tolerance: 0.06
+      ramp_duration_steps: 6000
+
+    trot_synchronization:
+      weight: 0.0
+      ramp_duration_steps: 6000
+  
+
+  injury:
+    enabled: false
+
+    penalty_pain: null  # 부상 다리에 접촉력·과부하가 생길 때 통증 페널티
+    intact_limb_overload: null  # 부상하지 않은 나머지 다리의 과부하 억제
+    injured_limb_force_nonuse: null  # 부상 다리를 완전히 들고 걷는 3족 보행 억제
+    joint_mirror_symmetry: null  # 좌우 대응 관절 자세의 과도한 비대칭 억제
+    injured_limb_load_duty_nonuse: null  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
+    injured_limb_load_duty_overuse: null  # 부상 다리의 유효 하중 시간이 너무 높은 경우
+    injured_limb_light_drag: null  # 부상 다리를 약하게 접촉하며 끄는 행동 억제
+
+
+# 종료 조건
+termination:
+  root_too_low:
+    enabled: true
+    minimum_height: 0.15
+
+  bad_orientation:
+    enabled: true
+    limit_angle: 0.8
+

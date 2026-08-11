@@ -48,556 +48,809 @@ from .mdp.events import (
 # Environment configuration
 ##
 
-
 @configclass
 class Go1LabPrivilegedObsCfg(ObsGroup):
-    """Teacher 전용 privileged observation (2차원).
-
-    Student LSTM 출력 target:
-    [0] 부상 상태 index: 0=정상, 1=FL, 2=FR, 3=RL, 4=RR
-    [1] 부목 등가 길이 (m): Go1 역기구학 기반
-    [2] 발 마찰 계수
-    """
-
-    peg_leg_index = ObsTerm(func=mdp.peg_leg_index)
-    peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length)
-    peg_leg_foot_friction = ObsTerm(func=mdp.peg_leg_foot_friction)
+    # Teacher에게 제공할 privileged observation 정의
+    #TODO: 이거 mdp에서 어떻게 특권정보 가져오는지 확인
+    peg_leg_one_index = ObsTerm(func=mdp.peg_leg_one_hot) # 부상 다리
+    peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length) # 부목 길이 
+    peg_leg_foot_friction = ObsTerm(func=mdp.peg_leg_foot_friction) # 발 마찰 계수
 
     def __post_init__(self):
-        self.enable_corruption = False
-        self.concatenate_terms = True
-
+        self.enable_corruption = False # priviliged observation noise
+        self.concatenate_terms = True # observation term을 하나의 벡터로 합침
 
 @configclass
 class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
     """Go1 Lab 환경 설정.
-
+    
+   - Phase 결정
+   - 로봇 actuator 설정
+   - observation 설정
+   - domain randomization
+   - reward 설정
+   - termination 설정
+   - 부상 다리 생성
+   - curriculum 설정
+   
     3-phase 학습 파이프라인:
       Phase 1 (GO1_PHASE=healthy): 정상 보행 pretrain
       Phase 2 (GO1_PHASE=teacher): peg-leg 환경 + privileged obs → Teacher PPO
       Phase 3 (GO1_PHASE=student): Teacher checkpoint 로드 → Student distill
     """
+    use_peg_leg: bool = None
+    use_peg_leg_action_mask: bool = None
+    grace_steps: int = None
 
     def __post_init__(self):
         super().__post_init__()
 
-        # =================================================================
-        # 1. Phase & Eval Mode
-        # =================================================================
-        # GO1_PHASE    : "healthy" | "teacher" | "student"
-        # GO1_EVAL_MODE: "random"(학습) | "normal" | "fl_peg" | "fr_peg" | "rl_peg" | "rr_peg"
-        phase = os.getenv("GO1_PHASE", "healthy").strip().lower()
-        eval_mode = os.getenv("GO1_EVAL_MODE", "random").strip().lower()
-        enable_peg_leg = phase in {"teacher", "student"}
-        self.use_peg_leg_action_mask = enable_peg_leg
-
-        # =================================================================
-        # 1b. Actuator: PD position control (paper §4.3 + Go1 sim-to-real std)
-        # =================================================================
-        # The inherited Go1 uses ActuatorNetMLP (a learned torque model). Every
-        # canonical Go1 sim-to-real pipeline (legged_gym / walk-these-ways / RMA /
-        # actuator-fault studies) instead uses PD position control (Kp~20, Kd~0.5,
-        # 50 Hz) — which also matches how the real Go1 is deployed (position
-        # targets with settable Kp/Kd) and the paper's §4.3. The learned actuator
-        # net is softer/laggier than a Kp20 deployment, so it cannot HOLD a loaded
-        # injured stance -> the trunk collapses (root_too_low). Switch to PD so the
-        # built-in proportional stiffness stabilises the antalgic stance.
-        # Enable with GO1_PD_ACTUATOR=1.
-        if os.getenv("GO1_PD_ACTUATOR", "0").strip().lower() in {"1", "true", "yes", "on"} and hasattr(self.scene, "robot"):
-            _kp = float(os.getenv("GO1_PD_KP", "20.0"))
-            _kd = float(os.getenv("GO1_PD_KD", "0.5"))
-            _eff = float(os.getenv("GO1_PD_EFFORT_LIMIT", "23.7"))
-            self.scene.robot.actuators = {
-                "base_legs": DCMotorCfg(
-                    joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                    effort_limit=_eff,
-                    saturation_effort=_eff,
-                    velocity_limit=30.0,
-                    stiffness=_kp,
-                    damping=_kd,
-                    friction=0.0,
-                )
-            }
-
-        # PhysX GPU broad-phase capacity: the default gpu_total_aggregate_pairs_
-        # capacity (2**21) overflows with 4096 envs under the stiffer PD actuator
-        # ("needs to increase ... otherwise the simulation will miss interactions"
-        # -> missed contacts -> instability -> NaN). Raise the pair buffers (cheap
-        # on a 96GB GPU) to keep the contact solver consistent.
-        if hasattr(self, "sim") and hasattr(self.sim, "physx"):
-            self.sim.physx.gpu_total_aggregate_pairs_capacity = max(
-                int(getattr(self.sim.physx, "gpu_total_aggregate_pairs_capacity", 0)), 2**23
+    def _apply_actuator_settings(self, cfg):
+        actuator_type = str(cfg["type"]).strip().lower()
+        
+        if actuator_type != "pd":
+            raise ValueError(
+                f"Unsupported actuator type: {actuator_type}"
             )
-            self.sim.physx.gpu_found_lost_pairs_capacity = max(
-                int(getattr(self.sim.physx, "gpu_found_lost_pairs_capacity", 0)), 2**23
+        
+        if not hasattr(self.scene, "robot"):
+            raise AttributeError("env_cfg.scene.robot does not exist")
+            
+        
+        pd_cfg = cfg['pd']
+        effort_limit = float(pd_cfg["effort_limit"])
+        
+        # scene: 시뮬레이션 세계 안에 배치되는 물체와 센서를 묶어서 관리하는 설정 객체
+        """
+        scene
+        ├── robot
+        ├── terrain
+        ├── contact_sensor
+        ├── height_scanner
+        ├── lights
+        └── 기타 rigid object
+        """
+        self.scene.robot.actuators = { 
+            "base_legs": DCMotorCfg(
+                joint_names_expr=[
+                    ".*_hip_joint",
+                    ".*_thigh_joint",
+                    ".*_calf_joint",
+                ],
+                effort_limit=effort_limit,
+                saturation_effort=effort_limit,
+                velocity_limit=float(pd_cfg["velocity_limit"]),
+                stiffness=float(pd_cfg["kp"]),
+                damping=float(pd_cfg["kd"]),
+                friction=float(pd_cfg["friction"]),
             )
+        }
+        
+    def _apply_simulation_settings(self, cfg: dict) -> None:
+        self.scene.replicate_physics = bool(cfg["replicate_physics"])
+        self.scene.clone_in_fabric = bool(cfg["clone_in_fabric"])
 
-        # Command-velocity range override (faithful viability via the TASK, not a
-        # use-floor): commanding FAST forward makes 3-leg non-use unable to track
-        # the velocity / unstable, so the agent must bear load on the peg to keep
-        # up -> the antalgic partial-loading can emerge from pure pain+energy+task.
-        # GO1_CMD_VX_MIN/MAX set the forward range; GO1_CMD_VY_ABS / GO1_CMD_YAW_ABS
-        # shrink lateral/turn so the task is dominated by forward speed.
-        if hasattr(self, "commands") and hasattr(self.commands, "base_velocity"):
-            _r = self.commands.base_velocity.ranges
-            _vxmin, _vxmax = os.getenv("GO1_CMD_VX_MIN"), os.getenv("GO1_CMD_VX_MAX")
-            if _vxmin and _vxmax:
-                _r.lin_vel_x = (float(_vxmin), float(_vxmax))
-            _vy = os.getenv("GO1_CMD_VY_ABS")
-            if _vy:
-                _r.lin_vel_y = (-float(_vy), float(_vy))
-            _yaw = os.getenv("GO1_CMD_YAW_ABS")
-            if _yaw:
-                _r.ang_vel_z = (-float(_yaw), float(_yaw))
+        gpu_cfg = cfg["gpu"]
 
-        # =================================================================
-        # 2. Scene & Observation
-        # =================================================================
-        if hasattr(self, "scene"):
-            # ⚠️ 주의: Healthy/Peg-leg 여부와 상관없이 무조건 False로 두어야 합니다.
-            # replicate_physics=True 로 설정할 경우, Isaac Sim PhysX 엔진에서 발바닥과 몸통의 
-            # 접촉(Contact) 센서(ContactSensor)를 초기화하지 못하고 튕기는 치명적 에러가 발생합니다.
-            if hasattr(self.scene, "replicate_physics"):
-                self.scene.replicate_physics = False
-            if hasattr(self.scene, "clone_in_fabric"):
-                self.scene.clone_in_fabric = False
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = int(
+            gpu_cfg["gpu_total_aggregate_pairs_capacity"]
+        )
+        self.sim.physx.gpu_found_lost_pairs_capacity = int(
+            gpu_cfg["gpu_found_lost_pairs_capacity"]
+        )
+        
+        terrain_cfg = cfg["terrain"]
 
-        # ⚠️ history_length 은 모든 Phase에서 1로 유지합니다.
-        # LSTM policy 가 시계열 메모리를 담당하므로 입력 frame stacking 은 불필요합니다.
-        # 특히 Phase 3 Distillation 에서는 Teacher 가 H=1 로 학습된 체크포인트를
-        # 로드하는데, H>1 로 설정하면 Teacher LSTM 입력 차원이 달라져 로드 실패합니다.
-        self.observations.policy.history_length = 1
+        # 지형이 flat이면
+        if bool(terrain_cfg["flat"]):
+            self.scene.terrain.terrain_type = "plane"
+            self.scene.terrain.terrain_generator = None
+            # curriculum은 학습이 진행될수록 환경의 난이도를 단계적으로 바꾸는 설정 모음
+            # self.curriculum.terrain_levels: 로봇의 성능에 따라 지형 난이도 레벨을 올리거나 내리는 항목
 
-        # Proprioception-only policy observation (GO1_PROPRIO_ONLY=1). The paper
-        # is explicit: proprioception-only R^48, "no exteroceptive sensing"
-        # (abstract, contribution iii, §4.3). The 187-dim height_scan both
-        # violates that and bloats the obs (235→48), which made a clean
-        # left/right-symmetric gait hard to converge (open-loop mirror
-        # equivariance was tight but the closed-loop limit cycle still leaned).
-        # Removing it restores the paper's blind locomotion structure and makes
-        # the mirror transform trivial (no height grid). The privileged_obs group
-        # (teacher only) is unaffected.
-        if os.getenv("GO1_PROPRIO_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}:
+
+        terrain_levels = terrain_cfg['curriculum']["terrain_levels"]
+        if terrain_levels is None:
+            self.curriculum.terrain_levels = None
+
+        compliance_cfg = cfg["contact_compliance"]
+
+        # 접촉의 물리적 성질을 설정(바닥의 단단함과 단단함에 따른 충격설정)
+        if bool(compliance_cfg["enabled"]):
+            stiffness = float(compliance_cfg["stiffness"])
+            damping = float(compliance_cfg["damping"])
+            # [접촉면이 얼마나 단단한지, 접촉할 때 충격이나 진동을 얼마나 감쇠]
+            """
+            stiffness가 큼: 단단한 바닥처럼 반응
+            stiffness가 작음: 푹신하거나 눌리는 바닥처럼 반응
+            
+            damping이 큼: 충격과 튀어 오름이 많이 줄어듦
+            damping이 작음: 충돌 후 진동하거나 튀는 현상이 커질 수 있음
+            """
+            materials = [self.sim.physics_material, self.scene.terrain.physics_material]
+            
+            # 시뮬레이션 기본 재질과 지형 재질을 찾아서 지원 가능한 재질에 접촉 스프링 강성인 stiffness와 접촉 감쇠인 damping을 적용
+            for material in materials:
+                # if material is not None and hasattr(material, "compliant_contact_stiffness"):
+                material.compliant_contact_stiffness = stiffness
+                material.compliant_contact_damping = damping    
+        
+    # 속도 명령 범위
+    def _apply_command_settings(self, cfg: dict) -> None:
+        ranges = self.commands.base_velocity.ranges
+
+        linear_x_cfg = cfg["linear_velocity_x"]
+
+        ranges.lin_vel_x = (
+            float(linear_x_cfg["min"]),
+            float(linear_x_cfg["max"]),
+        )
+
+        linear_y_abs = float(cfg["linear_velocity_y_abs"])
+        ranges.lin_vel_y = (
+            -linear_y_abs,
+            linear_y_abs,
+        )
+
+        yaw_abs = float(cfg["angular_velocity_yaw_abs"])
+        ranges.ang_vel_z = (
+            -yaw_abs,
+            yaw_abs,
+        )
+
+    def _apply_observation_settings(self, cfg: dict) -> None:
+        self.observations.policy.history_length = int(
+            cfg["history_length"]
+        )
+
+        # 지형 높이정보 제거
+        if not bool(cfg["use_height_scan"]):
             if hasattr(self.observations.policy, "height_scan"):
                 self.observations.policy.height_scan = None
 
-        # Optional flat terrain for TRAINING (GO1_FLAT_TERRAIN=1). The paper is
-        # flat / proprioception-only; training on ROUGH terrain + height_scan
-        # introduces a systematic left-right bias (probe on flat is symmetric,
-        # but rough-terrain training consistently commits to FR). Flattening
-        # makes the height_scan constant → removes that bias source.
-        if os.getenv("GO1_FLAT_TERRAIN", "0").strip().lower() in {"1", "true", "yes", "on"}:
-            if hasattr(self.scene, "terrain"):
-                _terr = self.scene.terrain
-                if hasattr(_terr, "terrain_type"):
-                    _terr.terrain_type = "plane"
-                if hasattr(_terr, "terrain_generator"):
-                    _terr.terrain_generator = None
-            # terrain_levels curriculum needs a terrain_generator; disable on flat.
-            if hasattr(self, "curriculum") and hasattr(self.curriculum, "terrain_levels"):
-                self.curriculum.terrain_levels = None
+        privileged_cfg = cfg["privileged"]
 
-        # Contact compliance: soften the foot-ground contact so the RIGID peg's
-        # sharp contact impulse is ABSORBED. The rigid splinted leg (calf τ=0) can
-        # then bear partial load without the sharp impact destabilising the trunk
-        # (the loading→sink failure mode). Models a rubber peg tip / compliant
-        # ground — keeps the splint rigid (intentional). GO1_CONTACT_COMPLIANCE_
-        # STIFFNESS>0 enables (lower = softer); default 0 = off (exact prior physics).
-        _cc = float(os.getenv("GO1_CONTACT_COMPLIANCE_STIFFNESS", "0.0"))
-        if _cc > 0.0:
-            _ccd = float(os.getenv("GO1_CONTACT_COMPLIANCE_DAMPING", "2000.0"))
-            _mats = [getattr(self.sim, "physics_material", None)]
-            if hasattr(self.scene, "terrain"):
-                _mats.append(getattr(self.scene.terrain, "physics_material", None))
-            for _mat in _mats:
-                if _mat is not None and hasattr(_mat, "compliant_contact_stiffness"):
-                    _mat.compliant_contact_stiffness = _cc
-                    _mat.compliant_contact_damping = _ccd
-
-        # 모든 Phase에서 privileged obs 등록 (Phase 1 → Phase 2 warm-start 호환성 보장)
-        # Phase 1(healthy)에서는 값이 [0, 0, 1.0] (정상, 부목 없음, 기본 마찰) 로 고정되어
-        # Teacher(Phase 2) 와 동일한 observation dim 을 유지합니다.
-        if hasattr(self, "observations"):
-            self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
-            # ONE-HOT injury encoding (GO1_INJURY_ONEHOT=1). A scalar index (0..4)
-            # is a weak conditioning signal: the teacher actor cannot cleanly learn
-            # 5 distinct per-leg antalgic gaits from one continuous value and
-            # collapses to its dominant mode (loads FL, abandons FR/RL/RR). A
-            # one-hot [FL,FR,RL,RR,injured_flag] makes per-leg conditioning LINEAR
-            # (RMA-standard for discrete privileged factors), so the teacher can
-            # produce a distinct antalgic response for every injury location.
-            # Changes privileged dim 3->7, so Phase-1 must be retrained with it.
-            if os.getenv("GO1_INJURY_ONEHOT", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                self.observations.privileged_obs.peg_leg_index = ObsTerm(func=mdp.peg_leg_one_hot)
-
-        # =================================================================
-        # [NEW] 생물학적 무게 중심(CoM) 이동을 위한 Payload 추가
-        # =================================================================
-        # 실제 개(Dog)의 전방 치우친 무게 배분을 모사하기 위해 trunk에 payload를 추가하고 CoM을 전방 이동.
-        # 이 설정을 통해 부상 시 뒷다리를 끄는(Dragging) RL의 꼼수를 물리적으로 원천 차단합니다.
-        if hasattr(self, "events"):
-            from isaaclab.envs.mdp.events import (
-                randomize_rigid_body_mass,
-                randomize_rigid_body_com,
+        if not bool(privileged_cfg["enabled"]):
+            raise ValueError(
+                "Phase 1 requires privileged observation for "
+                "Phase 2 warm-start dimension compatibility."
             )
 
-            # 기존 UnitreeGo1RoughEnvCfg에서 상속된 add_base_mass 무효화 (클래스 기반 이벤트인데 mode="startup"으로 설정되어 있어 에러 발생)
-            if hasattr(self.events, "add_base_mass"):
-                self.events.add_base_mass = None
+        # privileged observation group 설정 객체를 생성
+        self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
+        # [FL, FR, RL, RR, injured_flag]
+        
+        # 부상 전 nominal 기준의 calf 관절각 4차원 추가
+        if bool(cfg["use_calf_pos_nominal_rel"]):
+            self.observations.policy.calf_pos_abs = ObsTerm(
+                func=mdp.calf_pos_nominal_rel
+            )
+        else:
+            self.observations.policy.calf_pos_abs = None
+        
+    def _apply_domain_randomization_settings(self, cfg) -> None:
+        
+        if not bool(cfg["enabled"]):
+            return
 
-            # Go1 trunk 앞쪽에 얹은 payload를 등가적으로 모델링합니다.
-            # 기본값은 nominal Go1 기준 실험을 위해 비활성화합니다.
-            # 필요하면 환경변수로 실험별 조정:
-            #   GO1_FRONT_PAYLOAD_KG=0.0  -> payload 비활성화
-            #   GO1_FRONT_PAYLOAD_KG=2.0 GO1_FRONT_COM_X_M=0.05
-            front_payload_kg = float(os.getenv("GO1_FRONT_PAYLOAD_KG", "0.0"))
-            front_com_x_m = float(os.getenv("GO1_FRONT_COM_X_M", "0.0"))
-            front_com_z_m = float(os.getenv("GO1_FRONT_COM_Z_M", "0.0"))
+        from isaaclab.utils.noise import GaussianNoiseCfg
 
-            trunk_cfg = SceneEntityCfg("robot", body_names="trunk")
-            if front_payload_kg > 0.0:
-                self.events.front_payload_mass = EventTerm(
-                    func=randomize_rigid_body_mass,
-                    mode="startup",
-                    params={
-                        "asset_cfg": trunk_cfg,
-                        "mass_distribution_params": (front_payload_kg, front_payload_kg),
-                        "operation": "add",
-                        "distribution": "uniform",
-                        "recompute_inertia": True,
-                    },
-                )
+        friction_cfg = cfg["ground_friction"]
 
-            if abs(front_com_x_m) > 0.0 or abs(front_com_z_m) > 0.0:
-                self.events.front_payload_com = EventTerm(
-                    func=randomize_rigid_body_com,
-                    mode="startup",
-                    params={
-                        "asset_cfg": trunk_cfg,
-                        "com_range": {
-                            "x": (front_com_x_m, front_com_x_m),
-                            "y": (0.0, 0.0),
-                            "z": (front_com_z_m, front_com_z_m),
-                        },
-                    },
-                )
+        if (
+            bool(friction_cfg["enabled"])
+            and self.events.physics_material is not None
+        ):
+            self.events.physics_material.params[
+                "static_friction_range"
+            ] = tuple(float(v) for v in friction_cfg["static_range"])
 
-        # =================================================================
-        # Domain randomization for sim-to-real (paper §4.8). Gated by
-        # GO1_DOMAIN_RAND=1. Implements ground friction, robot mass, random
-        # pushes, and Gaussian observation noise. Motor-strength and
-        # action-latency randomization are added separately (custom — the
-        # ActuatorNetMLP has no built-in gain randomization).
-        # =================================================================
-        if os.getenv("GO1_DOMAIN_RAND", "0").strip().lower() in {"1", "true", "yes", "on"} and hasattr(self, "events"):
-            from isaaclab.utils.noise import GaussianNoiseCfg
+            self.events.physics_material.params[
+                "dynamic_friction_range"
+            ] = tuple(float(v) for v in friction_cfg["dynamic_range"])
 
-            # (a) ground friction U(0.5, 1.5)
-            if getattr(self.events, "physics_material", None) is not None:
-                self.events.physics_material.params["static_friction_range"] = (0.5, 1.5)
-                self.events.physics_material.params["dynamic_friction_range"] = (0.4, 1.2)
+        mass_cfg = cfg["robot_mass"]
 
-            # (b) robot mass U(0.85, 1.15) × nominal (scale the trunk mass;
-            #     the inherited add_base_mass targets a "base" body absent on Go1)
+        # add_base_mass를 다시 생성
+        if bool(mass_cfg["enabled"]):
+            scale_range = tuple(
+                float(v) for v in mass_cfg["scale_range"]
+            )
+
             self.events.add_base_mass = EventTerm(
                 func=mdp_base.randomize_rigid_body_mass,
                 mode="startup",
                 params={
-                    "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
-                    "mass_distribution_params": (0.85, 1.15),
+                    "asset_cfg": SceneEntityCfg(
+                        "robot",
+                        body_names=str(mass_cfg["body_name"]),
+                    ),
+                    "mass_distribution_params": scale_range,
                     "operation": "scale",
                     "distribution": "uniform",
                     "recompute_inertia": True,
                 },
             )
 
-            # (c) random base pushes for perturbation robustness
+        push_cfg = cfg["random_push"]
+
+        if bool(push_cfg["enabled"]):
             self.events.push_robot = EventTerm(
                 func=mdp_base.push_by_setting_velocity,
                 mode="interval",
-                interval_range_s=(8.0, 12.0),
-                params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+                interval_range_s=tuple(
+                    float(v) for v in push_cfg["interval_range_s"]
+                ),
+                params={
+                    "velocity_range": {
+                        "x": tuple(
+                            float(v)
+                            for v in push_cfg["velocity_x_range"]
+                        ),
+                        "y": tuple(
+                            float(v)
+                            for v in push_cfg["velocity_y_range"]
+                        ),
+                    }
+                },
             )
 
-            # (d) Gaussian observation noise: joint states N(0,0.02), IMU N(0,0.05)
-            _pol = self.observations.policy
-            for _term, _std in (
-                ("joint_pos", 0.02),
-                ("joint_vel", 0.02),
-                ("base_ang_vel", 0.05),
-                ("projected_gravity", 0.05),
-                ("base_lin_vel", 0.05),
-            ):
-                if getattr(_pol, _term, None) is not None:
-                    getattr(_pol, _term).noise = GaussianNoiseCfg(mean=0.0, std=_std)
+        noise_cfg = cfg["observation_noise"]
 
-        # Phase 1 paper baseline:
-        # 이후 Phase 2/3의 "Normal" 기준이 되는 보행이므로 좌우 force/duty 대칭을
-        # Phase 1부터 직접 맞춥니다. 완전히 순수한 Isaac Lab baseline이 필요하면
-        # GO1_PHASE1_BALANCE_REWARDS=0 으로 끌 수 있습니다.
-        use_phase1_balance_rewards = os.getenv("GO1_PHASE1_BALANCE_REWARDS", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if (not enable_peg_leg) and use_phase1_balance_rewards:
-            self.rewards.contact_force_asymmetry = RewTerm(
-                func=mdp.penalize_contact_force_asymmetry,
-                weight=float(os.getenv("GO1_CONTACT_FORCE_ASYM_WEIGHT", "-0.003")),
-                params={
-                    "ramp_start_steps": int(os.getenv("GO1_CONTACT_FORCE_ASYM_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_CONTACT_FORCE_ASYM_RAMP_STEPS", "6000")),
-                },
-            )
-            self.rewards.duty_factor_asymmetry = RewTerm(
-                func=mdp.penalize_duty_factor_asymmetry,
-                weight=float(os.getenv("GO1_DUTY_FACTOR_ASYM_WEIGHT", "-0.015")),
-                params={
-                    "contact_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                    "ramp_start_steps": int(os.getenv("GO1_DUTY_FACTOR_ASYM_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_DUTY_FACTOR_ASYM_RAMP_STEPS", "6000")),
-                },
-            )
-            self.rewards.diagonal_load_asymmetry = RewTerm(
-                func=mdp.penalize_diagonal_load_asymmetry,
-                weight=float(os.getenv("GO1_DIAGONAL_LOAD_ASYM_WEIGHT", "-0.0015")),
-                params={
-                    "ramp_start_steps": int(os.getenv("GO1_DIAGONAL_LOAD_ASYM_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_DIAGONAL_LOAD_ASYM_RAMP_STEPS", "6000")),
-                },
-            )
-            self.rewards.front_rear_load_distribution = RewTerm(
-                func=mdp.penalize_front_rear_load_distribution,
-                weight=float(os.getenv("GO1_FRONT_REAR_LOAD_DIST_WEIGHT", "-0.0005")),
-                params={
-                    "target_front_fraction": float(os.getenv("GO1_FRONT_LOAD_TARGET_FRACTION", "0.60")),
-                    "tolerance": float(os.getenv("GO1_FRONT_LOAD_TARGET_TOLERANCE", "0.10")),
-                    "ramp_start_steps": int(os.getenv("GO1_FRONT_REAR_LOAD_DIST_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_FRONT_REAR_LOAD_DIST_RAMP_STEPS", "6000")),
-                },
-            )
-            self.rewards.trot_sync = RewTerm(
-                func=mdp.reward_trot_synchronization,
-                weight=float(os.getenv("GO1_TROT_SYNC_WEIGHT", "0.03")),
-                params={
-                    "ramp_start_steps": int(os.getenv("GO1_TROT_SYNC_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_TROT_SYNC_RAMP_STEPS", "6000")),
-                },
-            )
-            self.rewards.duty_factor_deviation = RewTerm(
-                func=mdp.penalize_duty_factor_deviation,
-                weight=float(os.getenv("GO1_DUTY_FACTOR_DEVIATION_WEIGHT", "0.0")),
-                params={
-                    "contact_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                    "target_contact_count": float(os.getenv("GO1_TARGET_CONTACT_COUNT", "2.0")),
-                },
-            )
-            _target_duty = tuple(
-                float(v)
-                for v in os.getenv("GO1_LEG_DUTY_TARGETS", "0.55,0.55,0.50,0.50").split(",")
-            )
-            if len(_target_duty) != 4:
-                raise ValueError(
-                    "GO1_LEG_DUTY_TARGETS must contain four comma-separated values "
-                    "for FL,FR,RL,RR."
-                )
-            self.rewards.leg_duty_factor_targets = RewTerm(
-                func=mdp.penalize_leg_duty_factor_targets,
-                weight=float(os.getenv("GO1_LEG_DUTY_TARGET_WEIGHT", "0.0")),
-                params={
-                    "contact_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                    "target_duty": _target_duty,
-                    "tolerance": float(os.getenv("GO1_LEG_DUTY_TARGET_TOLERANCE", "0.03")),
-                    "ramp_start_steps": int(os.getenv("GO1_LEG_DUTY_TARGET_RAMP_START_STEPS", "2000")),
-                    "ramp_duration_steps": int(os.getenv("GO1_LEG_DUTY_TARGET_RAMP_STEPS", "6000")),
-                },
-            )
-            if hasattr(self.rewards, "feet_air_time"):
-                self.rewards.feet_air_time.weight = float(
-                    os.getenv("GO1_PHASE1_FEET_AIR_TIME_WEIGHT", str(self.rewards.feet_air_time.weight))
+        if bool(noise_cfg["enabled"]):
+            noise_mapping = {
+                "joint_pos": "joint_pos_std",
+                "joint_vel": "joint_vel_std",
+                "base_ang_vel": "base_ang_vel_std",
+                "projected_gravity": "projected_gravity_std",
+                "base_lin_vel": "base_lin_vel_std",
+            }
+
+            for term_name, yaml_key in noise_mapping.items():
+                term = getattr(
+                    self.observations.policy,
+                    term_name,
+                    None,
                 )
 
-        # Phase 1은 peg-leg curriculum/통증 보상/termination 수정 없이 종료합니다.
-        if not enable_peg_leg:
+                if term is not None:
+                    term.noise = GaussianNoiseCfg(
+                        mean=0.0,
+                        std=float(noise_cfg[yaml_key]),
+                    )
+
+    def _apply_symmetric_balance_rewards(self, cfg: dict) -> None:
+        reward_names = (
+            "contact_force_asymmetry",
+            "duty_factor_asymmetry",
+            "diagonal_load_asymmetry",
+            "front_rear_load_distribution",
+            "trot_sync",
+        )
+
+        if not bool(cfg["enabled"]):
+            for reward_name in reward_names:
+                setattr(self.rewards, reward_name, None)
             return
+        
+        # phase1 balance reward를 사용한다면
+        contact_cfg = cfg["contact_force_asymmetry"]
 
-        # =================================================================
-        # 3. 보상 설정 방침 (Phase 2/3 Trot 유지 튜닝)
-        # =================================================================
-        # 기본 UnitreeGo1RoughEnvCfg는 feet_air_time이 0.01로 매우 낮아,
-        # 로봇이 발을 거의 떼지 않고 질질 끄는 Tapping(토핑) 보행에 빠지기 쉽습니다.
-        # 인위적인 Trot Symmetry 보상 없이 자연스러운 대각선 보행(Trot)을 창발시키기 위해,
-        # 체공 시간 보상과 흔들림 페널티의 밸런스를 바로잡습니다.
-
-        use_phase2_gait_tuning = os.getenv("GO1_PHASE2_GAIT_TUNING", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
-        if use_phase2_gait_tuning and hasattr(self.rewards, "feet_air_time"):
-            # 발을 공중에 충분히 띄우도록 유도 (기존 0.01 -> 0.25)
-            self.rewards.feet_air_time.weight = float(os.getenv("GO1_FEET_AIR_TIME_WEIGHT", "0.25"))
-
-        if use_phase2_gait_tuning and hasattr(self.rewards, "action_rate_l2"):
-            # 다리를 부들부들 떨며 짧게 터치하는 현상 억제 (기존 -0.01 -> -0.05)
-            self.rewards.action_rate_l2.weight = float(os.getenv("GO1_ACTION_RATE_L2_WEIGHT", "-0.05"))
-
-        if use_phase2_gait_tuning and hasattr(self.rewards, "ang_vel_xy_l2"):
-            # 좌우 기우뚱거림(Rolling/Pitching) 강하게 억제
-            # -> Pacing이나 토끼뜀을 방지하고 Trot으로 수렴하게 만듦 (기존 -0.05 -> -0.1)
-            self.rewards.ang_vel_xy_l2.weight = float(os.getenv("GO1_ANG_VEL_XY_L2_WEIGHT", "-0.1"))
-
-        # [Trot 대칭성 보상 추가]
-        # 자연스러운 발현만으로는 좌우 대칭(SI 0%)에 도달하기까지 매우 오랜 학습이 필요하므로,
-        # 정상(Phase 1) 보행에 한하여 좌우/대각 대칭성을 강제하는 보상을 활성화합니다.
-        # (이 보상들은 mdp/rewards.py에 이미 "정상 다리에만 적용되도록" 구현되어 있습니다.)
         self.rewards.contact_force_asymmetry = RewTerm(
             func=mdp.penalize_contact_force_asymmetry,
-            weight=float(os.getenv("GO1_CONTACT_FORCE_ASYM_WEIGHT", "-0.012")),
+            weight=float(contact_cfg["weight"]),
             params={
-                "ramp_duration_steps": int(os.getenv("GO1_CONTACT_FORCE_ASYM_RAMP_STEPS", "6000")),
+                "ramp_duration_steps": int(
+                    contact_cfg["ramp_duration_steps"]
+                ),
             },
         )
+
+        duty_cfg = cfg["duty_factor_asymmetry"]
+
         self.rewards.duty_factor_asymmetry = RewTerm(
             func=mdp.penalize_duty_factor_asymmetry,
-            weight=float(os.getenv("GO1_DUTY_FACTOR_ASYM_WEIGHT", "-0.04")),
+            weight=float(duty_cfg["weight"]),
             params={
-                "contact_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                "ramp_duration_steps": int(os.getenv("GO1_DUTY_FACTOR_ASYM_RAMP_STEPS", "6000")),
+                "contact_threshold": float(
+                    duty_cfg["contact_threshold"]
+                ),
+                "ramp_duration_steps": int(
+                    duty_cfg["ramp_duration_steps"]
+                ),
             },
         )
+
+        diagonal_cfg = cfg["diagonal_load_asymmetry"]
+
         self.rewards.diagonal_load_asymmetry = RewTerm(
             func=mdp.penalize_diagonal_load_asymmetry,
-            weight=float(os.getenv("GO1_DIAGONAL_LOAD_ASYM_WEIGHT", "-0.006")),
+            weight=float(diagonal_cfg["weight"]),
             params={
-                "ramp_duration_steps": int(os.getenv("GO1_DIAGONAL_LOAD_ASYM_RAMP_STEPS", "6000")),
+                "ramp_duration_steps": int(
+                    diagonal_cfg["ramp_duration_steps"]
+                ),
             },
         )
+
+        front_rear_cfg = cfg[
+            "front_rear_load_distribution"
+        ]
+
         self.rewards.front_rear_load_distribution = RewTerm(
             func=mdp.penalize_front_rear_load_distribution,
-            weight=float(os.getenv("GO1_FRONT_REAR_LOAD_DIST_WEIGHT", "-0.0025")),
+            weight=float(front_rear_cfg["weight"]),
             params={
-                "target_front_fraction": float(os.getenv("GO1_FRONT_LOAD_TARGET_FRACTION", "0.55")),
-                "tolerance": float(os.getenv("GO1_FRONT_LOAD_TARGET_TOLERANCE", "0.06")),
-                "ramp_duration_steps": int(os.getenv("GO1_FRONT_REAR_LOAD_DIST_RAMP_STEPS", "6000")),
+                "target_front_fraction": float(
+                    front_rear_cfg["target_front_fraction"]
+                ),
+                "tolerance": float(
+                    front_rear_cfg["tolerance"]
+                ),
+                "ramp_duration_steps": int(
+                    front_rear_cfg["ramp_duration_steps"]
+                ),
             },
         )
+
+        trot_cfg = cfg["trot_synchronization"]
+
         self.rewards.trot_sync = RewTerm(
             func=mdp.reward_trot_synchronization,
-            weight=float(os.getenv("GO1_TROT_SYNC_WEIGHT", "0.12")),
+            weight=float(trot_cfg["weight"]),
             params={
-                "ramp_duration_steps": int(os.getenv("GO1_TROT_SYNC_RAMP_STEPS", "6000")),
+                "ramp_duration_steps": int(
+                    trot_cfg["ramp_duration_steps"]
+                ),
             },
         )
 
-        # =================================================================
-        # 4. Phase 2/3 안정화 — 너무 이른 몸통 접촉 종료 방지
-        # =================================================================
-        # Phase 1에서는 Isaac Lab 기본 base_contact termination을 그대로 둡니다.
-        # Phase 2/3에서는 peg-leg 적응 중 trunk가 살짝 닿는 상황이 너무 강한 종료 신호가 될 수 있어,
-        # 대신 "몸통이 너무 낮아진 경우"만 종료하고, 자세는 base_height penalty로 유도합니다.
-        self.rewards.base_height = RewTerm(
-            func=mdp_base.base_height_l2,
-            weight=float(os.getenv("GO1_BASE_HEIGHT_WEIGHT", "-0.3")),
-            params={
-                "target_height": float(os.getenv("GO1_BASE_HEIGHT_TARGET", "0.30")),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
+    def _apply_injury_reward_settings(self, cfg: dict, peg_leg_cfg) -> None:
+        if not bool(cfg["enabled"]):
+            return
 
-        # Flat-orientation (body-tilt ANGLE) penalty — keeps the trunk level so the
-        # policy loads a SHORTER peg leg by squatting/leaning slightly rather than
-        # ROLLING toward the injured corner until it tips over (bad_orientation).
-        # Default 0 = unchanged; set GO1_FLAT_ORIENTATION_WEIGHT (e.g. -1.5) to enable.
-        _flat_ori_w = float(os.getenv("GO1_FLAT_ORIENTATION_WEIGHT", "0.0"))
-        if _flat_ori_w != 0.0:
-            self.rewards.flat_orientation_l2 = RewTerm(
-                func=mdp_base.flat_orientation_l2,
-                weight=_flat_ori_w,
-                params={"asset_cfg": SceneEntityCfg("robot")},
-            )
+        pain_cfg = cfg["penalty_pain"]
 
-        # One-sided anti-collapse floor (stops the policy loading a SHORT peg by
-        # sinking the trunk to the ground / root_too_low). Steep penalty BELOW the
-        # floor only -> keeps the body up; loading then decreases with severity.
-        # Default 0 = off; set GO1_BASE_HEIGHT_FLOOR_WEIGHT (e.g. -8.0) to enable.
-        _floor_w = float(os.getenv("GO1_BASE_HEIGHT_FLOOR_WEIGHT", "0.0"))
-        if _floor_w != 0.0:
-            self.rewards.base_height_floor = RewTerm(
-                func=mdp.penalize_base_height_floor,
-                weight=_floor_w,
+        if pain_cfg["enabled"]:
+            self.rewards.penalty_pain = RewTerm(
+                func=mdp.penalty_pain,
+                weight=float(pain_cfg["weight"]),
                 params={
                     "asset_cfg": SceneEntityCfg("robot"),
-                    "height_floor": float(os.getenv("GO1_BASE_HEIGHT_FLOOR", "0.32")),
+                    "sensor_name": "contact_forces",
+                    "failure_force_threshold": float(pain_cfg["failure_force_threshold"]),
+                    "pain_scale": float(pain_cfg["pain_scale"]),
+                    
+                    "max_exp_argument": float(pain_cfg["max_exp_argument"]),
+                    "max_penalty": float(pain_cfg["max_penalty"]),
+                    
+                    "base_contact_cost": float(pain_cfg["base_contact_cost"]),
+                    "contact_detect_threshold": float(pain_cfg["contact_detect_threshold"]),
+                    "include_calf": bool(pain_cfg["include_calf"]),
                 },
             )
+        else:
+            self.rewards.penalty_pain = None
+        
+    
+        
+        splint_min, splint_max = peg_leg_cfg['splint_length_range'][0], peg_leg_cfg['splint_length_range'][1]
+        
+        # 부상 다리를 사용하지 않는 것에 대한 패널티 (그걸 지면으로 부터 받는 힘을 측정)
+        force_cfg = cfg["injured_limb_force_nonuse"]
+        
+        if force_cfg['enabled']:
+            self.rewards.injured_limb_force_nonuse = RewTerm(
+                func=mdp.penalize_injured_limb_force_nonuse, # 부상 다리의 평균 접촉력이 최소 목표보다 부족한지를 계산하는 함수
+                weight=float(force_cfg["weight"]),
+                params={
+                    "sensor_name": "contact_forces",
+                    "severe_splint_length": splint_min,
+                    "mild_splint_length": splint_max,
+                    "min_force_severe": float(force_cfg['min_force_severe']),
+                    "min_force_mild": float(force_cfg['min_force_mild']),
+                    "front_leg_multiplier": float(force_cfg["front_leg_multiplier"]),
+                    "rear_leg_multiplier": float(force_cfg["rear_leg_multiplier"]),    
+                    "ema_alpha": float(force_cfg["ema_alpha"]),
+                    "ramp_start_steps": int(force_cfg["ramp_start_steps"]),
+                    "ramp_duration_steps": int(force_cfg["ramp_duration_steps"]),
+                    "include_calf": bool(force_cfg["include_calf"]),
+                },
+            )
+        else:
+            self.rewards.injured_limb_force_nonuse = True
+                    
+            
+        duty_nonuse_cfg = cfg[
+            "injured_limb_load_duty_nonuse"
+        ]
+        
+        # 부상 다리가 일정 시간 동안 하중을 거의 전혀 받지 않는 상태, 즉 부상 다리를 계속 들고 3족 보행하는 것을 막는 페널티
+        if duty_nonuse_cfg["enabled"]:
+            self.rewards.injured_limb_load_duty_nonuse = RewTerm(
+                func=mdp.penalize_injured_limb_load_duty_nonuse,
+                weight=float(duty_nonuse_cfg["weight"]),
+                params={
+                    "sensor_name": "contact_forces",
+                    "load_contact_threshold": float(
+                        duty_nonuse_cfg["load_contact_threshold"]
+                    ),
+                    
+                    "severe_splint_length": splint_min,
+                    "mild_splint_length": splint_max,
+                    
+                    "min_duty_severe": float(
+                        duty_nonuse_cfg["min_duty_severe"]
+                    ),
+                    "min_duty_mild": float(
+                        duty_nonuse_cfg["min_duty_mild"]
+                    ),
+                    "front_leg_multiplier": float(
+                        duty_nonuse_cfg["front_leg_multiplier"]
+                    ),
+                    "rear_leg_multiplier": float(
+                        duty_nonuse_cfg["rear_leg_multiplier"]
+                    ),
+                    "ema_alpha": float(
+                        duty_nonuse_cfg["ema_alpha"]
+                    ),
+                    "ramp_duration_steps": int(
+                        duty_nonuse_cfg["ramp_duration_steps"]
+                    ),
+                },
+            )
+        else:
+           self.rewards.injured_limb_load_duty_nonuse = None
 
-        self.terminations.root_too_low = DoneTerm(
-            func=mdp_base.root_height_below_minimum,
+        
+    def _apply_reward_settings(self, cfg, peg_leg_cfg) -> None:
+        
+        task_cfg = cfg["task"]
+
+        if bool(task_cfg["enabled"]):
+            self.rewards.track_lin_vel_xy_exp.weight = float(
+                task_cfg["track_linear_velocity_weight"]
+            )
+            self.rewards.track_ang_vel_z_exp.weight = float(
+                task_cfg["track_angular_velocity_weight"]
+            )
+            self.rewards.lin_vel_z_l2.weight = float(
+                task_cfg["linear_velocity_z_weight"]
+            )
+
+        gait_cfg = cfg["gait_tuning"]
+
+        if bool(gait_cfg["enabled"]):
+            self.rewards.feet_air_time.weight = float(
+                gait_cfg["feet_air_time_weight"]
+            )
+            self.rewards.action_rate_l2.weight = float(
+                gait_cfg["action_rate_weight"]
+            )
+            self.rewards.ang_vel_xy_l2.weight = float(
+                gait_cfg["angular_velocity_xy_weight"]
+            )
+
+        energy_cfg = cfg["energy"]
+
+        self.rewards.dof_torques_l2.weight *= float(
+            energy_cfg["torque_penalty_scale"]
+        )
+        self.rewards.dof_acc_l2.weight *= float(
+            energy_cfg["dof_acc_penalty_scale"]
+        )
+        self.rewards.action_rate_l2.weight *= float(
+            energy_cfg["action_rate_penalty_scale"]
+        )
+
+        posture_cfg = cfg["posture"]
+
+        self.rewards.flat_orientation_l2.weight = float(
+            posture_cfg["flat_orientation_weight"]
+        )
+
+        self.rewards.base_height = RewTerm(
+            func=mdp_base.base_height_l2,
+            weight=float(posture_cfg["base_height_weight"]),
             params={
-                "minimum_height": float(os.getenv("GO1_ROOT_TOO_LOW_MIN_HEIGHT", "0.15")),
+                "target_height": float(
+                    posture_cfg["base_height_target"]
+                ),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
+        
+        calf_contact_cfg = cfg['calf_contact']
+        
+        if bool(calf_contact_cfg['enabled']):
+            self.rewards.intact_calf_contact = RewTerm(
+                func=mdp.penalize_knee_shin_contact,
+                weight=float(calf_contact_cfg["weight"]),
+                params={
+                    "asset_cfg": SceneEntityCfg("robot"),
+                    "sensor_name": "contact_forces",
+                    "force_threshold": float(calf_contact_cfg["force_threshold"]),
+                    "max_overload": float(calf_contact_cfg["max_overload"]),
+                    "use_z_only": bool(calf_contact_cfg.get["use_z_only"]),
+                },
+            )
+        else:
+            self.rewards.intact_calf_contact = None
 
-        # Paper §4.3 terminations (opt-in via GO1_STRICT_TERMINATIONS=1):
-        #   terminate on base contact + base roll/pitch beyond ±0.8 rad.
-        # Rationale ("task forces leg use"): without these, the policy can hold
-        # the SHORTER peg leg off the ground (non-use) via tilted/degenerate
-        # postures and still survive. Restoring them forces an upright, stable
-        # 4-leg stance, so the peg must contact and bear load; pain then caps
-        # that load near Fth(=10N) → ~69% GRF reduction (normal per-leg force
-        # ≈ 32N, so 10N ≈ 69% reduction — matches the paper).
-        strict_terminations = os.getenv("GO1_STRICT_TERMINATIONS", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if strict_terminations:
+
+        alive_cfg = cfg["survival_bonus"]
+        
+        if alive_cfg['enabled']:
+            # alive bonus
+            self.rewards.survival_bonus = RewTerm(
+                func=mdp_base.is_alive,
+                weight=float(alive_cfg["weight"]),
+            )
+
+        joint_mirror_cfg = cfg["joint_mirror_symmetry"]
+        
+        if joint_mirror_cfg['enabled']:
+            self.rewards.joint_mirror_symmetry = RewTerm(
+                func=mdp.penalize_joint_mirror_asymmetry,
+                weight=float(joint_mirror_cfg['weight']),
+                params={"asset_cfg": SceneEntityCfg("robot")},
+            )
+        else:
+            self.rewards.joint_mirror_symmetry = None
+        
+        
+        # symmetric for Normal Walking 
+        self._apply_symmetric_balance_rewards(cfg["symmetric"])
+        
+        # injury reward
+        self._apply_injury_reward_settings(cfg["injury"], peg_leg_cfg)
+                    
+    def _apply_termination_settings(self, cfg) -> None:
+        root_cfg = cfg["root_too_low"]
+        if bool(root_cfg["enabled"]):
+            self.terminations.root_too_low = DoneTerm(
+                func=mdp_base.root_height_below_minimum,
+                params={
+                    "minimum_height": float(
+                        root_cfg["minimum_height"]
+                    ),
+                    "asset_cfg": SceneEntityCfg("robot"),
+                },
+            )
+        
+        orientation_cfg = cfg["bad_orientation"]
+        if bool(orientation_cfg["enabled"]):
             self.terminations.bad_orientation = DoneTerm(
                 func=mdp_base.bad_orientation,
-                params={"limit_angle": float(os.getenv("GO1_BAD_ORIENTATION_LIMIT", "0.8"))},
+                params={
+                    "limit_angle": float(
+                        orientation_cfg["limit_angle"]
+                    )
+                },
             )
-            # keep the inherited base_contact termination (do NOT disable it)
         else:
-            if hasattr(self.terminations, "base_contact"):
-                self.terminations.base_contact = None
-
-        # =================================================================
-        # 5. Peg-leg 시나리오 (Phase 2/3 전용)
-        # =================================================================
-        # ----- 부상 확률/부목 길이 결정 -----
-        prob_peg_leg = max(0.0, min(1.0, float(os.getenv("GO1_PROB_PEG_LEG", "0.5"))))
-        splint_min = float(os.getenv("GO1_SPLINT_LENGTH_MIN", "0.20"))
-        splint_max = float(os.getenv("GO1_SPLINT_LENGTH_MAX", "0.30"))
-        splint_min, splint_max = min(splint_min, splint_max), max(splint_min, splint_max)
-        foot_friction_min = float(os.getenv("GO1_FOOT_FRICTION_MIN", "0.4"))
-        foot_friction_max = float(os.getenv("GO1_FOOT_FRICTION_MAX", "1.0"))
-        foot_friction_min, foot_friction_max = (
-            min(foot_friction_min, foot_friction_max),
-            max(foot_friction_min, foot_friction_max),
+            self.terminations.base_contact = None
+        
+    # domain Random에 의해 덮어짐
+    def _apply_payload_settings(self, cfg) -> None:
+        # 상속받은 기존 질량제거 추후 domain randomization에서 생성해줌
+        self.events.add_base_mass = None
+        self.events.front_payload_mass = None
+        self.events.front_payload_com = None         
+        
+        if not bool(cfg["enabled"]):
+            return
+        
+        # Go1의 trunk에 앞쪽에 무게추가
+        from isaaclab.envs.mdp.events import (
+            randomize_rigid_body_com, # Center of Mass를 변경
+            randomize_rigid_body_mass, # Rigid body의 질량을 변경
         )
-        target_leg = "random"
+        
+        front_payload_kg = float(cfg["front_payload_kg"])
+        front_com_x_m = float(cfg["front_com_x_m"])
+        front_com_z_m = float(cfg["front_com_z_m"])
 
-        # eval_mode 오버라이드 (평가 모드가 커리큘럼 설정보다 우선)
+        trunk_cfg = SceneEntityCfg(
+            "robot",
+            body_names="trunk",
+        )
+
+        # trunk에 고정 추가 질량 적용
+        self.events.front_payload_mass = EventTerm(
+            func=randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": trunk_cfg,
+                "mass_distribution_params": (
+                    front_payload_kg,
+                    front_payload_kg,
+                ),
+                "operation": "add",
+                "distribution": "uniform",
+                "recompute_inertia": True,
+            },
+        )
+
+        # trunk CoM 이동
+        self.events.front_payload_com = EventTerm(
+            func=randomize_rigid_body_com,
+            mode="startup",
+            params={
+                "asset_cfg": trunk_cfg,
+                "com_range": {
+                    "x": (
+                        front_com_x_m,
+                        front_com_x_m,
+                    ),
+                    "y": (0.0, 0.0),
+                    "z": (
+                        front_com_z_m,
+                        front_com_z_m,
+                    ),
+                },
+            },
+        )
+    
+    
+    def _apply_curriculum_settings(self, cfg: dict,  steps_per_iteration: int, target_leg: str, healthy_slots: int):
+        if not cfg['enabled']:
+            return
+        
+        leg_cfg = cfg["leg_probability"]
+        splint_cfg = cfg["splint_length"]
+
+        # 부상 확률 curriculum
+        prob_initial = float(leg_cfg["initial"])
+        prob_final = float(leg_cfg["final"])
+        prob_iterations = int(leg_cfg["iterations"])
+
+        # 부목 길이 curriculum
+        initial_min = float(splint_cfg["initial_min"])
+        initial_max = float(splint_cfg["initial_max"])
+        final_min = float(splint_cfg["final_min"])
+        final_max = float(splint_cfg["final_max"])
+        splint_iterations = int(splint_cfg["iterations"])
+        
+        # 설정값 검증
+        if not 0.0 <= prob_initial <= 1.0:
+            raise ValueError(
+                f"leg_probability.initial must be in [0, 1], got {prob_initial}"
+            )
+
+        if not 0.0 <= prob_final <= 1.0:
+            raise ValueError(
+                f"leg_probability.final must be in [0, 1], got {prob_final}"
+            )
+
+        if prob_iterations <= 0:
+            raise ValueError(
+                f"leg_probability.iterations must be positive, got {prob_iterations}"
+            )
+
+        if splint_iterations <= 0:
+            raise ValueError(
+                f"splint_length.iterations must be positive, got {splint_iterations}"
+            )
+
+        if initial_min > initial_max:
+            raise ValueError(
+                "splint_length.initial_min must be less than or equal to initial_max"
+            )
+
+        if final_min > final_max:
+            raise ValueError(
+                "splint_length.final_min must be less than or equal to final_max"
+            )
+        
+        self.curriculum.peg_leg_difficulty = CurTerm(
+            func=peg_leg_curriculum,
+            params={
+                # 부상 확률: 0.1 -> 0.5
+                "prob_start": prob_initial,
+                "prob_end": prob_final,
+                "prob_ramp_steps": prob_iterations,
+
+                # 부목 길이 상한: 0.33 -> 0.30
+                "splint_start": initial_max,
+                "splint_end": final_max,
+
+                # 부목 길이 하한: 0.28 -> 0.20
+                "splint_lo_start": initial_min,
+                "splint_lo_end": final_min,
+
+                "splint_ramp_steps": splint_iterations,
+                "steps_per_iteration": steps_per_iteration,
+                "target_leg": target_leg,
+                "healthy_slots": healthy_slots,
+            },
+        )
+            
+    
+    def _set_target_and_peg_leg_prob_for_eval(self, eval_peg_leg: str | None, target_leg: str, prob_peg_leg: float):
+        """평가 모드가 있으면 학습용 target/prob 값을 평가용으로 덮어쓴다."""
+
+        # train.py에서 호출하면 평가 override가 없으므로 학습값 유지
+        if eval_peg_leg is None:
+            return target_leg, prob_peg_leg
+
+        eval_mode = eval_peg_leg.strip().lower()
+
         if eval_mode == "normal":
-            target_leg = "normal"
-            prob_peg_leg = 0.0
-        elif eval_mode in {"fl_peg", "fr_peg", "rl_peg", "rr_peg"}:
-            target_leg = eval_mode.replace("_peg", "")
-            prob_peg_leg = 1.0
-        elif eval_mode == "balanced":
-            # Balanced validation keeps Normal/FL/FR/RL/RR at 1:1:1:1:1,
-            # but uses a random permutation so left/right injury conditions do
-            # not stay tied to fixed env ids or terrain shards.
-            target_leg = os.getenv("GO1_BALANCED_TARGET_MODE", "balanced_random").strip().lower()
-            prob_peg_leg = 0.8
+            return "normal", 0.0
 
-        # ----- (A) Peg-leg 리셋 이벤트 (에피소드 시작 시 1회) -----
+        if eval_mode in {"fl", "fr", "rl", "rr"}:
+            return eval_mode, 1.0
+
+        if eval_mode == "balanced":
+            return "balanced_random", 0.8
+
+        raise ValueError(
+            f"Unsupported eval peg leg: {eval_mode!r}"
+        )
+
+         
+    def _apply_peg_leg_event_settings(self, cfg: dict, steps_per_iteration: int, eval_peg_leg:str = None) -> None:
+        # 이벤트 자체를 등록하지 않는 모드
+        self.use_peg_leg = bool(cfg["enabled"])
+        
+        if not self.use_peg_leg:
+            self.events.randomize_peg_leg_actuation = None
+            self.events.enforce_peg_leg = None
+            self.curriculum.peg_leg_difficulty = None
+            
+            if eval_peg_leg not in (None, "normal"):
+                raise ValueError(
+                    f"peg_leg.enabled=false인 환경에서는 "
+                    f"eval.peg_leg={eval_peg_leg!r}를 사용할 수 없습니다."
+                )
+
+            return
+
+        self.grace_steps = int(cfg['grace_steps'])
+        
+        if self.grace_steps < 0:
+            raise ValueError("grace_steps must be greater than or equal to zero")
+        
+        
+        
+        # 기본값은 antalgic.yaml의 학습 설정
+        target_leg = str(cfg["target_leg"]).strip().lower()
+        prob_peg_leg = max(0.0, min(1.0, float(cfg["prob_peg_leg"])))
+        
+        
+        # test.py에서 평가값을 넘겼다면 평가용으로 덮어쓰기
+        target_leg, prob_peg_leg = (
+            self._set_target_and_peg_leg_prob_for_eval(
+                eval_peg_leg=eval_peg_leg,
+                target_leg=target_leg,
+                prob_peg_leg=prob_peg_leg,
+            )
+        )
+            
+        splint_range = tuple(float(value) for value in cfg["splint_length_range"])
+        foot_friction_range = tuple(float(value) for value in cfg["foot_friction_range"])
+        injured_foot_friction_only = bool(cfg["injured_foot_friction_only"])
+        
+        # 부목길이
+        splint_range = (min(splint_range), max(splint_range))
+        
+        # 발 마찰 계수
+        foot_friction_range = (min(foot_friction_range), max(foot_friction_range))
+        
+        # 에피소드가 reset될 때 부상 상태와 관련 버퍼 초기화
+        # env._peg_leg_index 가 생성됨
+        hip_torque_cfg = cfg["hip_torque"]
+        hip_torque_scale = float(hip_torque_cfg["scale"])
+        weaken_joints = str(hip_torque_cfg["weaken_joints"]).strip().lower()
+
+        
+        splint_actuator_cfg = cfg["splint_actuator"]
+        splint_calf_stiffness = float(splint_actuator_cfg["stiffness"])
+        splint_calf_damping = float(splint_actuator_cfg["damping"])
+
+        healthy_slots = int(cfg["env_fixed_healthy_slots"])
+        
         self.events.randomize_peg_leg_actuation = EventTerm(
             func=randomize_peg_leg_actuation,
             mode="reset",
@@ -605,238 +858,57 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 "asset_cfg": SceneEntityCfg("robot"),
                 "prob_peg_leg": prob_peg_leg,
                 "target_leg": target_leg,
-                "prob_joint_disabled": 1.0,
-                "actuation_mode": "locked",
-                "splint_length_range": (splint_min, splint_max),
-                "foot_friction_range": (foot_friction_min, foot_friction_max),
+                "prob_joint_disabled":  float(cfg["prob_joint_disabled"]),
+                "splint_length_range": splint_range,
+                "foot_friction_range": foot_friction_range,
+                
+                "injured_foot_friction_only": injured_foot_friction_only,
+                
+                "hip_torque_scale": hip_torque_scale,
+                "weaken_joints": weaken_joints,
+                
+                # 부상 calf 전용 PD
+                "splint_calf_stiffness": splint_calf_stiffness,
+                "splint_calf_damping": splint_calf_damping,
+                
+                # 정상 보행을 할 환경 구성 갯수
+                "healthy_slots": healthy_slots,
             },
         )
 
-        # ----- (A-2) Peg-leg 강제 고정 이벤트 (매 스텝) -----
-        # 관절이 굽혀지지 않도록 매 스텝마다 위치/속도를 강제 고정합니다.
+        # 매 스텝 부상 관절의 고정 상태 유지
         self.events.enforce_peg_leg = EventTerm(
             func=enforce_peg_leg_constraints,
             mode="interval",
-            interval_range_s=(0.0, 0.0), 
+            interval_range_s=(0.0, 0.0),
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
-
-        # ----- (B) Peg-leg 커리큘럼 -----
+        
+        # # ----- (B) Peg-leg 커리큘럼 -----
         # 학습 초기: 10% 부상, 거의 정상 길이(0.30m)
         # 학습 후기: 50% 부상, 짧은 부목(0.20m)
-        if os.getenv("GO1_USE_PEG_LEG_CURRICULUM", "1").strip().lower() in {"1", "true", "yes", "on"}:
-            self.curriculum.peg_leg_difficulty = CurTerm(
-                func=peg_leg_curriculum,
-                params={
-                    "prob_start": float(os.getenv("GO1_CURRICULUM_PROB_START", "0.1")),
-                    "prob_end": prob_peg_leg,
-                    "prob_ramp_steps": int(os.getenv("GO1_CURRICULUM_PROB_RAMP_STEPS", "5000")),
-                    "splint_start": float(os.getenv("GO1_CURRICULUM_SPLINT_HI_START", "0.33")),
-                    "splint_end": splint_max,
-                    "splint_lo_start": float(os.getenv("GO1_CURRICULUM_SPLINT_LO_START", "0.28")),
-                    "splint_lo_end": splint_min,
-                    "splint_ramp_steps": int(os.getenv("GO1_CURRICULUM_SPLINT_RAMP_STEPS", "8000")),
-                },
-            )
+        self._apply_curriculum_settings(cfg['curriculum'], steps_per_iteration, target_leg, healthy_slots)
+        
+    
+    def apply_environment_settings(self, settings: dict, steps_per_iteration: int, eval_peg_leg:str =None):
+        # phase = str(settings["name"]).strip().lower()
+        steps_per_iteration = int(steps_per_iteration)
+        
+        self.use_peg_leg_action_mask = bool(settings["use_peg_leg_action_mask"])
+        
+        self._apply_peg_leg_event_settings(settings['peg_leg'], steps_per_iteration, eval_peg_leg=eval_peg_leg)
+        self._apply_actuator_settings(settings["actuator"])
+        self._apply_simulation_settings(settings["simulation"])
+        self._apply_command_settings(settings["command"])
+        self._apply_observation_settings(settings["observation"])
 
-        # =================================================================
-        # 5. Phase 2/3 부상 시나리오 — Emergent Limping
-        # =================================================================
-        #
-        # [연구 논지]
-        #   실제 동물이 다리를 다쳤을 때 '절뚝이는' 보행은 누군가가 가르쳐서
-        #   나오는 것이 아니라, `통증(pain)` 과 `에너지 소비(energy)` 라는 두 가지
-        #   생리학적 비용을 최소화하려는 과정에서 자연선택이 찾은 최적해입니다.
-        #
-        #   이 프로젝트는 강화학습 에이전트에게 그 두 가지 비용 신호만 주고
-        #   (보행 방식을 '처방' 하지 않고) 절뚝임이 emergent behavior 로
-        #   나타남을 보이는 것이 목표입니다.
-        #
-        # [설계 원칙]
-        #   정상 env 와 부상 env 모두 동일한 Phase 1 baseline 보상을 공유합니다
-        #   (track_lin_vel, track_ang_vel, feet_air_time, dof_torques_l2,
-        #   dof_acc_l2, action_rate_l2 등). Phase 2 에서는 부상 env 에
-        #   pain/load-duration 비용과 건측 과부하/완전 비사용 방지용 약한
-        #   생체역학 regularizer만 추가합니다.
-        #
-        # [pain 모델 (include_calf=True)]
-        #   부상 다리의 발(foot) + 정강이(calf) 접촉력을 합산 → 팔다리 전체가
-        #   '아픈 부위'. 무릎 보행 exploit 도 통증으로 자연 차단됩니다.
-        #
-        #     leg_force = |F_z(foot)| + |F_z(calf)|
-        #     pain      = base_cost · 1[leg_force > 1N]                  # 접촉 자체의 통증
-        #               + load_cost · 1[leg_force > load_th]             # 누적 하중 통증
-        #               + clamp(exp(scale · max(leg_force - th, 0)) - 1) # 과부하 통증
-        #
-        # [에너지 패널티]
-        #   Phase 1 baseline 에서 이미 `dof_torques_l2(-0.0002)` 와
-        #   `dof_acc_l2(-2.5e-7)` 이 활성화되어 있어, 모든 관절 사용이
-        #   비용으로 반영됩니다. 별도로 부상 다리만 억제하는 항은 두지 않습니다
-        #   ('에너지 최소화' 는 전신에 공평하게 적용).
-        #
-        # =================================================================
-        #
-        # [v7 핵심 변경점]
-        #   v5/v6: threshold=5N, base_cost=0.15 → 너무 공격적 → 넘어짐 40%
-        #   v7초안: threshold=20N, base_cost=0.05 → 너무 관대 → 드래깅 위험
-        #
-        #   최종 균형점: threshold=12N, base_cost=0.1
-        #   - 12N 이하 접촉(균형 잡기용 톡톡): base_cost(0.1)만 부과
-        #     → 짧게 짚으면 누적 비용 작음, 길게 끌면 누적 비용 큼
-        #   - 12N 초과(체중 실기): 지수적 통증 급등 (pain_scale=0.15)
-        #     → 세게 밟는 것은 강력히 억제
-        #
-        #   드래깅 비용 분석:
-        #     끌기(연속 접촉) = 0.1 × 0.08 = 매 스텝 -0.008 누적
-        #     20스텝 끌기 = -0.16 (상당한 페널티)
-        #     vs. 짧게 2~3스텝 짚기 = -0.016~0.024 (감당 가능)
-        #   → "짧게 짚어서 균형 잡기 OK, 질질 끌기 NO"
-        self.rewards.penalty_pain = RewTerm(
-            func=mdp.penalty_pain,
-            weight=float(os.getenv("GO1_PAIN_WEIGHT", "-0.08")),
-            params={
-                "asset_cfg": SceneEntityCfg("robot"),
-                "sensor_name": "contact_forces",
-                "failure_force_threshold": float(os.getenv("GO1_PAIN_THRESHOLD_N", "12.0")),
-                "pain_scale": float(os.getenv("GO1_PAIN_SCALE", "0.15")),
-                "overload_tolerance": float(os.getenv("GO1_PAIN_OVERLOAD_TOLERANCE", "0.0")),
-                "max_exp_argument": float(os.getenv("GO1_PAIN_MAX_EXP_ARGUMENT", "6.0")),
-                "max_penalty": float(os.getenv("GO1_PAIN_MAX_PENALTY", "20.0")),
-                "base_contact_cost": float(os.getenv("GO1_PAIN_BASE_CONTACT_COST", "2.0")),
-                "contact_detect_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                "load_contact_cost": float(os.getenv("GO1_PAIN_LOAD_CONTACT_COST", "0.0")),
-                "load_contact_threshold": float(os.getenv("GO1_LOAD_CONTACT_THRESHOLD_N", "10.0")),
-                "load_contact_cost_severe_multiplier": float(
-                    os.getenv("GO1_PAIN_LOAD_COST_SEVERE_MULT", "1.20")
-                ),
-                "load_contact_cost_mild_multiplier": float(
-                    os.getenv("GO1_PAIN_LOAD_COST_MILD_MULT", "0.80")
-                ),
-                "base_contact_cost_severe_multiplier": float(
-                    os.getenv("GO1_PAIN_BASE_CONTACT_SEVERE_MULT", "1.0")
-                ),
-                "base_contact_cost_mild_multiplier": float(
-                    os.getenv("GO1_PAIN_BASE_CONTACT_MILD_MULT", "1.0")
-                ),
-                "include_calf": os.getenv("GO1_PAIN_INCLUDE_CALF", "1").strip().lower()
-                in {"1", "true", "yes", "on"},
-                "severity_scaled": os.getenv("GO1_PAIN_SEVERITY_SCALING", "0").strip().lower()
-                in {"1", "true", "yes", "on"},
-                "severe_splint_length": splint_min,
-                "mild_splint_length": splint_max,
-                "threshold_severe_multiplier": float(os.getenv("GO1_PAIN_THRESHOLD_SEVERE_MULT", "0.80")),
-                "threshold_mild_multiplier": float(os.getenv("GO1_PAIN_THRESHOLD_MILD_MULT", "1.15")),
-                "scale_severe_multiplier": float(os.getenv("GO1_PAIN_SCALE_SEVERE_MULT", "1.25")),
-                "scale_mild_multiplier": float(os.getenv("GO1_PAIN_SCALE_MILD_MULT", "0.85")),
-            },
-        )
-
-        self.rewards.intact_limb_overload = RewTerm(
-            func=mdp.penalize_intact_limb_overload,
-            weight=float(os.getenv("GO1_INTACT_OVERLOAD_WEIGHT", "0.0")),
-            params={
-                "sensor_name": "contact_forces",
-                "overload_threshold": float(os.getenv("GO1_INTACT_OVERLOAD_THRESHOLD_N", "65.0")),
-                "overload_scale": float(os.getenv("GO1_INTACT_OVERLOAD_SCALE", "1.0")),
-                "max_penalty": float(os.getenv("GO1_INTACT_OVERLOAD_MAX_PENALTY", "120.0")),
-                "use_z_only": True,
-            },
-        )
-
-        self.rewards.injured_limb_force_nonuse = RewTerm(
-            func=mdp.penalize_injured_limb_force_nonuse,
-            weight=float(os.getenv("GO1_INJURED_FORCE_NONUSE_WEIGHT", "0.0")),
-            params={
-                "sensor_name": "contact_forces",
-                "severe_splint_length": splint_min,
-                "mild_splint_length": splint_max,
-                "min_force_severe": float(os.getenv("GO1_INJURED_MIN_FORCE_SEVERE_N", "2.0")),
-                "min_force_mild": float(os.getenv("GO1_INJURED_MIN_FORCE_MILD_N", "11.0")),
-                "front_leg_multiplier": float(os.getenv("GO1_INJURED_MIN_FORCE_FRONT_MULT", "1.15")),
-                "rear_leg_multiplier": float(os.getenv("GO1_INJURED_MIN_FORCE_REAR_MULT", "1.0")),
-                "ema_alpha": float(os.getenv("GO1_INJURED_NONUSE_EMA_ALPHA", "0.995")),
-                "ramp_duration_steps": int(os.getenv("GO1_INJURED_NONUSE_RAMP_STEPS", "8000")),
-                "include_calf": os.getenv("GO1_INJURED_NONUSE_INCLUDE_CALF", "1").strip().lower()
-                in {"1", "true", "yes", "on"},
-            },
-        )
-
-        # §4.7 symmetry-encouraging BASELINE penalty: -λs||q - M(q)||^2 (joint
-        # mirror). Default 0 (off). Set GO1_SYMMETRY_PENALTY_WEIGHT<0 to train the
-        # symmetry-encouraging comparison paradigm (forces L-R symmetric gait even
-        # under injury → expected to fail the antalgic biomechanical match).
-        self.rewards.joint_mirror_symmetry = RewTerm(
-            func=mdp.penalize_joint_mirror_asymmetry,
-            weight=float(os.getenv("GO1_SYMMETRY_PENALTY_WEIGHT", "0.0")),
-            params={"asset_cfg": SceneEntityCfg("robot")},
-        )
-
-        self.rewards.injured_limb_load_duty_nonuse = RewTerm(
-            func=mdp.penalize_injured_limb_load_duty_nonuse,
-            weight=float(os.getenv("GO1_INJURED_DUTY_NONUSE_WEIGHT", "0.0")),
-            params={
-                "sensor_name": "contact_forces",
-                "load_contact_threshold": float(os.getenv("GO1_LOAD_CONTACT_THRESHOLD_N", "10.0")),
-                "severe_splint_length": splint_min,
-                "mild_splint_length": splint_max,
-                "min_duty_severe": float(os.getenv("GO1_INJURED_MIN_DUTY_SEVERE", "0.05")),
-                "min_duty_mild": float(os.getenv("GO1_INJURED_MIN_DUTY_MILD", "0.28")),
-                "front_leg_multiplier": float(os.getenv("GO1_INJURED_MIN_DUTY_FRONT_MULT", "1.10")),
-                "rear_leg_multiplier": float(os.getenv("GO1_INJURED_MIN_DUTY_REAR_MULT", "1.0")),
-                "ema_alpha": float(os.getenv("GO1_INJURED_NONUSE_EMA_ALPHA", "0.995")),
-                "ramp_duration_steps": int(os.getenv("GO1_INJURED_NONUSE_RAMP_STEPS", "8000")),
-            },
-        )
-
-        self.rewards.injured_limb_load_duty_overuse = RewTerm(
-            func=mdp.penalize_injured_limb_load_duty_overuse,
-            weight=float(os.getenv("GO1_INJURED_DUTY_OVERUSE_WEIGHT", "0.0")),
-            params={
-                "sensor_name": "contact_forces",
-                "load_contact_threshold": float(os.getenv("GO1_LOAD_CONTACT_THRESHOLD_N", "10.0")),
-                "severe_splint_length": splint_min,
-                "mild_splint_length": splint_max,
-                "max_duty_severe": float(os.getenv("GO1_INJURED_MAX_DUTY_SEVERE", "0.30")),
-                "max_duty_mild": float(os.getenv("GO1_INJURED_MAX_DUTY_MILD", "0.50")),
-                "front_leg_multiplier": float(os.getenv("GO1_INJURED_MAX_DUTY_FRONT_MULT", "0.95")),
-                "rear_leg_multiplier": float(os.getenv("GO1_INJURED_MAX_DUTY_REAR_MULT", "1.0")),
-                "ramp_duration_steps": int(os.getenv("GO1_INJURED_OVERUSE_RAMP_STEPS", "8000")),
-            },
-        )
-
-        self.rewards.injured_limb_light_drag = RewTerm(
-            func=mdp.penalize_injured_limb_light_drag,
-            weight=float(os.getenv("GO1_INJURED_LIGHT_DRAG_WEIGHT", "0.0")),
-            params={
-                "sensor_name": "contact_forces",
-                "contact_threshold": float(os.getenv("GO1_PAIN_CONTACT_THRESHOLD_N", "1.0")),
-                "load_contact_threshold": float(os.getenv("GO1_LOAD_CONTACT_THRESHOLD_N", "10.0")),
-                "ramp_duration_steps": int(os.getenv("GO1_INJURED_NONUSE_RAMP_STEPS", "8000")),
-            },
-        )
-
-        # 생존 보상 — 오래 생존할수록 더 많은 보상 → 넘어짐 회피 강화
-        self.rewards.survival_bonus = RewTerm(
-            func=mdp_base.is_alive,
-            weight=float(os.getenv("GO1_SURVIVAL_BONUS_WEIGHT", "1.5")),
-        )
-
-        # =================================================================
-        # 7. Phase 2/3 전용: 소폭 보상 조정 (warmstart 호환성 유지)
-        # =================================================================
-        # 에너지 페널티를 50%만 완화하여 절뚝임을 위한 에너지 예산을 소폭 확보
-        if hasattr(self.rewards, "track_lin_vel_xy_exp"):
-            self.rewards.track_lin_vel_xy_exp.weight = float(os.getenv("GO1_TRACK_LIN_VEL_WEIGHT", "2.5"))
-        if hasattr(self.rewards, "dof_torques_l2"):
-            _dt_abs = os.getenv("GO1_DOF_TORQUES_WEIGHT")
-            if _dt_abs:
-                # absolute override (unambiguous; bypasses the *=scale chain)
-                self.rewards.dof_torques_l2.weight = float(_dt_abs)
-            else:
-                self.rewards.dof_torques_l2.weight *= float(os.getenv("GO1_TORQUE_PENALTY_SCALE", "0.5"))
-        if hasattr(self.rewards, "dof_acc_l2"):
-            self.rewards.dof_acc_l2.weight *= float(os.getenv("GO1_DOF_ACC_PENALTY_SCALE", "0.5"))
-        if hasattr(self.rewards, "action_rate_l2"):
-            self.rewards.action_rate_l2.weight *= float(os.getenv("GO1_ACTION_RATE_PENALTY_SCALE", "0.5"))
+        # payload가 기존 add_base_mass를 정리한 후,
+        # domain randomization이 새 mass event를 등록하도록 이 순서 유지
+        self._apply_payload_settings(settings["payload"])
+        self._apply_domain_randomization_settings(settings["domain_randomization"])
+        
+        self._apply_reward_settings(settings["reward"], settings['peg_leg'])
+        self._apply_termination_settings(settings["termination"])
+    

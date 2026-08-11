@@ -1,0 +1,38 @@
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase2_cfg_entry_point
+
+  num_envs: 2048
+  max_iterations: 8000 # 8000, 500
+  seed: 42
+
+checkpoint:
+  mode: "warmstart" # warmstart, resume
+  teacher: /home/unicon/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_07_12_59_40_phase1_s42_P1-005/model_5999.pt
+  #teacher: /home/unicon/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_08_12_30_08_phase2_s42_P2-001/model_13998.pt
+  student: ""
+  load_optimizer: false # false, true
+  reset_iteration: false 
+  
+env:
+  path: ../env/antalgic.yaml
+
+eval:
+  peg_leg: normal # normal, fl, fr, rl, rr
+
+exploration:
+  noise_std:
+    # 실제 사용할 탐색 노이즈 방식
+    set: log  # scalar 또는 log
+
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true
+
+      log:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true

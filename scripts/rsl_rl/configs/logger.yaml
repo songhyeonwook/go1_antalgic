@@ -1,0 +1,51 @@
+version: 1
+
+formatters:
+  rev_full:
+    format: "%(asctime)s - %(name)s - %(levelname)5s - %(message)s"
+    datefmt: "%Y%m%d %H:%M:%S"
+
+  rev_full2:
+    format: "%(asctime)s:%(levelname)5s: %(filename)s:%(funcName)s:%(lineno)d:\t %(message)s"
+    datefmt: "%Y%m%d %H:%M:%S"
+
+  rev_small1:
+    format: "%(asctime)s - %(name)s - %(levelname)5s - %(message)s"
+    datefmt: "%H:%M:%S"
+
+  rev_mini1:
+    format: "%(asctime)s - %(message)s"
+    datefmt: "%H:%M"
+
+  rev_mini2:
+    format: "%(asctime)s.%(msecs)03d:%(levelname)5s: %(filename)s:%(funcName)s:%(lineno)d:\t %(message)s"
+    datefmt: "%H:%M:%S"
+
+  rev_mini3:
+    format: "%(asctime)s:%(levelname)5s: %(lineno)d:\t %(message)s"
+    datefmt: "%H:%M"
+
+  rev_mini0:
+    format: "%(lineno)3d: %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: rev_mini2
+    stream: ext://sys.stdout
+
+  info_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: rev_full2
+    filename: logs/mem_control.log
+    maxBytes: 100000000
+    backupCount: 10
+    encoding: utf-8
+
+root:
+  level: DEBUG
+  handlers:
+    - console
+    - info_file_handler

@@ -401,28 +401,7 @@ def reward_trot_synchronization(
     return reward
 
 
-def penalize_joint_mirror_asymmetry(
-    env: "ManagerBasedRLEnv",
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """§4.7 symmetry-encouraging baseline penalty: ||q - M(q)||^2.
-
-    M is the left/right joint mirror (FL↔FR, RL↔RR with hip-abduction sign flip).
-    Applied to ALL envs (incl. injured) to force a left-right symmetric joint
-    configuration even under injury — the 'symmetry-encouraging' paradigm whose
-    forced symmetry is expected to FAIL the injured-animal biomechanical match
-    (it suppresses the antalgic asymmetry). The raw joint_pos is used: the Go1
-    default pose (hip ±0.1) is already mirror-symmetric so a symmetric stance
-    incurs zero penalty.
-    """
-    from .mirror import mirror_joint_tensor
-
-    asset: Articulation = env.scene[asset_cfg.name]
-    q = asset.data.joint_pos
-    qm = mirror_joint_tensor(q)
-    return torch.sum((q - qm) ** 2, dim=-1)
-
-
+# 대칭보행 패널티
 def penalize_contact_force_asymmetry(
     env: "ManagerBasedRLEnv",
     sensor_name: str = "contact_forces",
@@ -436,13 +415,15 @@ def penalize_contact_force_asymmetry(
     정상 보행에서도 좌우 대칭 보행을 유도하고,
     부상 시에는 건측-환측 하중 차이가 자연스러우므로 부상 env는 제외합니다.
     """
-    contact_by_foot = _foot_force_ema(env, sensor_name=sensor_name, use_z_only=use_z_only, ema_alpha=ema_alpha)
+    
+    # 시간 평균 접촉력 계산
+    contact_by_foot = _foot_force_ema(env, sensor_name=sensor_name, use_z_only=use_z_only, ema_alpha=ema_alpha) # 지수 이동평균 사용
     peg_leg_idx = _peg_leg_index_per_env(env)
-    is_normal = peg_leg_idx < 0
+    is_normal = peg_leg_idx < 0 # 정상 환경만 선택
 
     diff_front = torch.abs(contact_by_foot[:, 0] - contact_by_foot[:, 1])
     diff_rear = torch.abs(contact_by_foot[:, 2] - contact_by_foot[:, 3])
-    asym = diff_front + diff_rear
+    asym = diff_front + diff_rear # 전체 비대칭 정도 계산
 
     penalty = torch.zeros(env.num_envs, device=env.device)
     penalty[is_normal] = asym[is_normal] * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
@@ -702,15 +683,11 @@ def penalty_pain(
     sensor_name: str = "contact_forces",
     failure_force_threshold: float = 60.0,
     pain_scale: float = 0.08,
-    overload_tolerance: float = 0.0,
     max_exp_argument: float = 8.0,
     max_penalty: float = 200.0,
     base_contact_cost: float = 0.0,
     contact_detect_threshold: float = 1.0,
-    load_contact_cost: float = 0.0,
-    load_contact_threshold: float = 10.0,
-    load_contact_cost_severe_multiplier: float = 1.20,
-    load_contact_cost_mild_multiplier: float = 0.80,
+    
     base_contact_cost_severe_multiplier: float = 1.0,
     base_contact_cost_mild_multiplier: float = 1.0,
     include_calf: bool = True,
@@ -771,9 +748,7 @@ def penalty_pain(
         base_contact_cost_severe/mild_multiplier: severity scaling of
             Pbase. Severe splints carry higher contact cost, driving
             the severity trend in force reduction.
-        load_contact_cost: optional additional cost per step when
-            Fz > load_contact_threshold. Set to 0 for paper-faithful
-            implementation (not in paper equation 4).
+        
         include_calf: if True, add calf contact force to leg_force
             to prevent the knee-walking exploit.
     """
@@ -797,57 +772,40 @@ def penalty_pain(
     scale = float(pain_scale)
     base_cost = float(base_contact_cost)
     detect_th = float(contact_detect_threshold)
-    load_cost = float(load_contact_cost)
-    load_th = float(load_contact_threshold)
-    severity_alpha = None
-    if severity_scaled:
-        severity_alpha = _splint_severity_alpha(
-            env,
-            severe_splint_length=severe_splint_length,
-            mild_splint_length=mild_splint_length,
-        )
 
     for leg in range(4):
         mask = peg_leg_idx == leg
+
         if not mask.any():
             continue
-        leg_force = contact_by_foot[mask, leg] + contact_by_calf[mask, leg]
-        threshold_t = threshold
-        scale_t = scale
-        load_cost_t = load_cost
-        base_cost_t: float | torch.Tensor = base_cost
-        if severity_alpha is not None:
-            alpha = severity_alpha[mask]
-            threshold_mult = float(threshold_severe_multiplier) + (
-                float(threshold_mild_multiplier) - float(threshold_severe_multiplier)
-            ) * alpha
-            scale_mult = float(scale_severe_multiplier) + (
-                float(scale_mild_multiplier) - float(scale_severe_multiplier)
-            ) * alpha
-            load_cost_mult = float(load_contact_cost_severe_multiplier) + (
-                float(load_contact_cost_mild_multiplier)
-                - float(load_contact_cost_severe_multiplier)
-            ) * alpha
-            base_cost_mult = float(base_contact_cost_severe_multiplier) + (
-                float(base_contact_cost_mild_multiplier)
-                - float(base_contact_cost_severe_multiplier)
-            ) * alpha
-            threshold_t = threshold * threshold_mult
-            scale_t = scale * scale_mult
-            load_cost_t = load_cost * load_cost_mult
-            base_cost_t = base_cost * base_cost_mult
+
+        leg_force = (
+            contact_by_foot[mask, leg]
+            + contact_by_calf[mask, leg]
+        )
 
         if base_cost > 0.0:
-            is_contact = (leg_force > detect_th).float()
-            penalty[mask] += base_cost_t * is_contact
-        if load_cost > 0.0:
-            is_load_contact = (leg_force > load_th).float()
-            penalty[mask] += load_cost_t * is_load_contact
+            is_contact = (
+                leg_force > detect_th
+            ).float()
 
-        overload = torch.clamp(leg_force - threshold_t - float(overload_tolerance), min=0.0)
-        exp_arg = torch.clamp(scale_t * overload, min=0.0, max=float(max_exp_argument))
-        penalty[mask] += torch.clamp(torch.expm1(exp_arg), max=float(max_penalty))
+            penalty[mask] += base_cost * is_contact
 
+        overload = torch.clamp(
+            leg_force - threshold,
+            min=0.0,
+        )
+
+        exp_arg = torch.clamp(
+            scale * overload,
+            min=0.0,
+            max=float(max_exp_argument),
+        )
+
+        penalty[mask] += torch.clamp(
+            torch.expm1(exp_arg),
+            max=float(max_penalty),
+        )
     return penalty
 
 
@@ -868,40 +826,6 @@ def penalize_base_height_floor(
     return torch.square(torch.clamp(float(height_floor) - h, min=0.0))
 
 
-def penalize_intact_limb_overload(
-    env: "ManagerBasedRLEnv",
-    sensor_name: str = "contact_forces",
-    overload_threshold: float = 65.0,
-    overload_scale: float = 1.0,
-    max_penalty: float = 120.0,
-    use_z_only: bool = True,
-) -> torch.Tensor:
-    """부상 환경에서 건측 다리 과부하를 패널티로 부여합니다.
-
-    통증 회피만 있으면 정책이 부상 다리를 완전히 버리고 3족 보행으로 수렴할 수 있습니다.
-    실제 동물에서는 이런 보행이 가능하더라도 나머지 다리에 과부하/피로/불안정 비용이 생기므로,
-    건측 다리의 과도한 peak GRF를 별도 생체역학 비용으로 둡니다.
-
-    이 항은 부상 다리를 쓰라고 직접 보상하지 않습니다. 대신 3족 보행의 건측 과부하를
-    비용화해서 partial unloading 해를 더 경쟁력 있게 만듭니다.
-    """
-    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-    peg_leg_idx = _peg_leg_index_per_env(env)
-
-    penalty = torch.zeros(env.num_envs, device=env.device)
-    threshold = float(overload_threshold)
-    scale = float(overload_scale)
-    for injured_leg in range(4):
-        mask = peg_leg_idx == injured_leg
-        if not mask.any():
-            continue
-        intact_forces = contact_by_foot[mask].clone()
-        intact_forces[:, injured_leg] = 0.0
-        overload = torch.clamp(intact_forces - threshold, min=0.0)
-        penalty[mask] = torch.clamp(torch.sum(overload, dim=1) * scale, max=float(max_penalty))
-    return penalty
-
-
 def _splint_severity_alpha(
     env: "ManagerBasedRLEnv",
     severe_splint_length: float,
@@ -916,7 +840,6 @@ def _splint_severity_alpha(
     hi = float(mild_splint_length)
     denom = max(hi - lo, 1e-6)
     return torch.clamp((splint_length.to(env.device) - lo) / denom, min=0.0, max=1.0)
-
 
 def penalize_injured_limb_force_nonuse(
     env: "ManagerBasedRLEnv",
@@ -1012,7 +935,7 @@ def penalize_injured_limb_force_nonuse(
     penalty = torch.zeros(env.num_envs, device=env.device)
     penalty[is_injured] = torch.clamp(target[is_injured] - ema[is_injured], min=0.0)
     return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
-
+    
 
 def penalize_injured_limb_load_duty_nonuse(
     env: "ManagerBasedRLEnv",
@@ -1090,86 +1013,29 @@ def penalize_injured_limb_load_duty_nonuse(
     penalty[is_injured] = torch.clamp(target[is_injured] - ema[is_injured], min=0.0)
     return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
 
-
-def penalize_injured_limb_load_duty_overuse(
+def penalize_joint_mirror_asymmetry(
     env: "ManagerBasedRLEnv",
-    sensor_name: str = "contact_forces",
-    load_contact_threshold: float = 10.0,
-    use_z_only: bool = True,
-    ema_alpha: float = 0.995,
-    severe_splint_length: float = 0.20,
-    mild_splint_length: float = 0.30,
-    max_duty_severe: float = 0.30,
-    max_duty_mild: float = 0.50,
-    front_leg_multiplier: float = 0.95,
-    rear_leg_multiplier: float = 1.0,
-    ramp_start_steps: int = 1000,
-    ramp_duration_steps: int = 8000,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Penalize excessive load-bearing duty on the injured limb.
+    """§4.7 symmetry-encouraging baseline penalty: ||q - M(q)||^2.
 
-    The non-use term sets a residual-support floor. This term adds the matching
-    upper bound: severe/short splints should unload more, while mild/long
-    splints may still take partial support. It is still an antalgic cost, not a
-    gait template, because it only depends on injured-limb load duty and splint
-    severity.
+    M is the left/right joint mirror (FL↔FR, RL↔RR with hip-abduction sign flip).
+    Applied to ALL envs (incl. injured) to force a left-right symmetric joint
+    configuration even under injury — the 'symmetry-encouraging' paradigm whose
+    forced symmetry is expected to FAIL the injured-animal biomechanical match
+    (it suppresses the antalgic asymmetry). The raw joint_pos is used: the Go1
+    default pose (hip ±0.1) is already mirror-symmetric so a symmetric stance
+    incurs zero penalty.
     """
-    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-    peg_leg_idx = _peg_leg_index_per_env(env)
+    from .mirror import mirror_joint_tensor
 
-    injured_contact = torch.zeros(env.num_envs, device=env.device)
-    for leg in range(4):
-        mask = peg_leg_idx == leg
-        if mask.any():
-            injured_contact[mask] = (
-                contact_by_foot[mask, leg] > float(load_contact_threshold)
-            ).float()
-
-    alpha = float(max(0.0, min(0.9999, ema_alpha)))
-    ema = getattr(env, "_go1_injured_load_duty_overuse_ema", None)
-    prev_idx = getattr(env, "_go1_injured_load_duty_overuse_ema_idx", None)
-    prev_splint = getattr(env, "_go1_injured_load_duty_overuse_ema_splint", None)
-    splint_length = getattr(env, "_peg_leg_splint_length", None)
-    if ema is None or ema.shape != injured_contact.shape:
-        ema = injured_contact.detach().clone()
-    else:
-        changed = prev_idx is None or prev_idx.shape != peg_leg_idx.shape
-        if changed:
-            changed_mask = torch.ones_like(peg_leg_idx, dtype=torch.bool)
-        else:
-            changed_mask = prev_idx.to(env.device) != peg_leg_idx
-            if splint_length is not None:
-                if prev_splint is None or prev_splint.shape != splint_length.shape:
-                    changed_mask = torch.ones_like(changed_mask, dtype=torch.bool)
-                else:
-                    changed_mask = changed_mask | (
-                        torch.abs(prev_splint.to(env.device) - splint_length.to(env.device)) > 1e-4
-                    )
-        if changed_mask.any():
-            ema[changed_mask] = injured_contact.detach()[changed_mask]
-        ema.mul_(alpha).add_(injured_contact.detach(), alpha=1.0 - alpha)
-    env._go1_injured_load_duty_overuse_ema = ema
-    env._go1_injured_load_duty_overuse_ema_idx = peg_leg_idx.detach().clone()
-    if splint_length is not None:
-        env._go1_injured_load_duty_overuse_ema_splint = splint_length.detach().clone()
-
-    severity_alpha = _splint_severity_alpha(env, severe_splint_length, mild_splint_length)
-    target = float(max_duty_severe) + (
-        float(max_duty_mild) - float(max_duty_severe)
-    ) * severity_alpha
-    front_mask = (peg_leg_idx == 0) | (peg_leg_idx == 1)
-    target = torch.where(
-        front_mask,
-        target * float(front_leg_multiplier),
-        target * float(rear_leg_multiplier),
-    )
-
-    is_injured = peg_leg_idx >= 0
-    penalty = torch.zeros(env.num_envs, device=env.device)
-    penalty[is_injured] = torch.clamp(ema[is_injured] - target[is_injured], min=0.0)
-    return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
+    asset: Articulation = env.scene[asset_cfg.name]
+    q = asset.data.joint_pos
+    qm = mirror_joint_tensor(q)
+    return torch.sum((q - qm) ** 2, dim=-1)
 
 
+# 발을 끄는 것에 대한 패널티가 아님. 접촉하는 것에 대한 패널티
 def penalize_injured_limb_light_drag(
     env: "ManagerBasedRLEnv",
     sensor_name: str = "contact_forces",

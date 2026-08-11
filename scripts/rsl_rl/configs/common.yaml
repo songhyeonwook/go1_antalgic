@@ -1,0 +1,2 @@
+rsl_logger: tensorboard
+device: cuda:0

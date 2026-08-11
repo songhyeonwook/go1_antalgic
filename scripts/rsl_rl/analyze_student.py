@@ -126,9 +126,9 @@ if args_cli.balanced_envs:
 # Phase 자동 감지 → agent 기본값 결정
 _phase = os.getenv("GO1_PHASE", "healthy").strip().lower()
 _AGENT_DEFAULTS = {
-    "healthy": "rsl_rl_cfg_entry_point",
-    "teacher": "rsl_rl_teacher_cfg_entry_point",
-    "student": "rsl_rl_distill_cfg_entry_point",
+    "healthy": "rsl_rl_phase1_cfg_entry_point",
+    "teacher": "rsl_rl_phase2_cfg_entry_point",
+    "student": "rsl_rl_phase3_cfg_entry_point",
 }
 if args_cli.agent is None:
     args_cli.agent = _AGENT_DEFAULTS.get(_phase, "rsl_rl_cfg_entry_point")
@@ -510,6 +510,10 @@ def main(
                 actions = policy(obs)
             ret = env.step(actions)
             obs = ret[0]
+
+            dones = ret[2]
+            if use_distillation:
+                runner.alg.policy.reset(dones)
 
         forces = sensor.data.net_forces_w
         if args_cli.contact_use_z_only:

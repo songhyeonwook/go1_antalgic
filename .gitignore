@@ -1,16 +1,38 @@
-# training artifacts / data (not part of the algorithm)
+# training artifacts / data
 logs/
 outputs/
 runs/
 biomech/
 pd_logs/
-*.npz
-*.pt
-*.onnx
-*.jit
 wandb/
 
-# python
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.jit
+
+# Hydra / TensorBoard / runtime output
+.hydra/
+multirun/
+events.out.tfevents.*
+*.log
+
+# videos
+videos/
+*.mp4
+*.avi
+
+# generated configuration snapshots
+scripts/rsl_rl/go1_phase*_env_cfg.yaml
+scripts/rsl_rl/*_effective_config.yaml
+
+# manual backup configs
+scripts/rsl_rl/configs/env/backup_*.yaml
+
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -21,8 +43,34 @@ dist/
 .venv/
 venv/
 
+# lint / test caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# backup / temporary files
+*.orig
+*.rej
+*.bak
+*~
+*.tmp
+
+# crash dumps
+core
+core.*
+*.dmp
+
 # editor / OS
 .vscode/
 .idea/
 .DS_Store
 *.swp
+
+# local environment / secrets
+.env
+.env.*
+!.env.example
+.secrets/

@@ -1,0 +1,38 @@
+train:
+  project_name: unitree_go1_antalgic 
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase1_cfg_entry_point
+  
+  num_envs: 2048
+  max_iterations: 5000
+  seed: 42
+
+checkpoint:
+  mode: scratch
+  teacher: 
+  student: 
+  load_optimizer: false 
+  reset_iteration: true
+
+env:
+  path: ../env/healthy.yaml
+
+
+eval:
+  peg_leg: normal 
+
+exploration:
+  noise_std:
+    # 실제 사용할 탐색 노이즈 방식
+    set: log  # scalar 또는 log
+
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true
+
+      log:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true
