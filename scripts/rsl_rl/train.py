@@ -3,9 +3,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to train RL agent with RSL-RL."""
+"""Script to train RL agent with RSL-RL.
 
-"""Launch Isaac Sim Simulator first."""
+사용 예:
+    PYTHONPATH=<repo>/source/go1_lab python train.py --phase 1 --headless --run_tag P1-001
+"""
 
 import argparse
 import sys
@@ -133,6 +135,19 @@ app_logger.info(
     "Training configuration:\n%s",
     prettyjson(config_snapshot),
 )
+
+# 어느 저장소의 go1_lab 을 쓸지는 PYTHONPATH 로 직접 지정한다 (사본 간 혼동 방지).
+# Isaac Sim 부팅(수십 초) 후에 ImportError 로 죽지 않도록 여기서 미리 검사한다.
+import importlib.util
+
+if importlib.util.find_spec("go1_lab") is None:
+    _repo_hint = Path(__file__).resolve().parents[2] / "source" / "go1_lab"
+    sys.exit(
+        "[train] go1_lab 패키지를 찾을 수 없습니다. 사용할 저장소를 직접 지정해 실행하세요:\n"
+        f"  PYTHONPATH={_repo_hint} python train.py --phase N\n"
+        "  (다른 저장소 사본을 쓰려면 그 저장소의 source/go1_lab 경로를 지정)"
+    )
+
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
@@ -161,8 +176,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_tasks  # noqa: F401
 import go1_lab.tasks  # noqa: F401
-
-from peg_leg_action_wrapper import PegLegActionMaskWrapper
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -353,11 +366,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     app_logger.info("Rollout steps per PPO iteration: %d", steps_per_iteration)
     
     # create isaac environment
+    # (부상 action mask 는 Go1LabEnv.step() 내부에서 수행 — 별도 래퍼 불필요)
     env = gym.make(train_cfg.task, cfg=env_cfg, render_mode=None)
-
-    # # Phase 2, 3에서만 부상 action mask 적용
-    # if config.phase in ("phase2", "phase3"):
-    #     env = PegLegActionMaskWrapper(env)
 
     # RSL-RL 환경 wrapper
     env = RslRlVecEnvWrapper(env)
@@ -372,7 +382,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env=env,
             train_cfg=agent_cfg_dict,
             log_dir=str(log_dir),
-            logger=app_logger,
+            #logger=app_logger,
             device=agent_cfg.device,
         )
 

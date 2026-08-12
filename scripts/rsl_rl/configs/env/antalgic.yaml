@@ -5,29 +5,37 @@ peg_leg:
   enabled: true
   grace_steps: 30
 
+  # 부목 부착 링크: thigh(무릎 고정 다리보조기, 전후 스윙 가능) | hip(강체 지팡이)
+  attach: thigh
+  # 부상 무릎을 접어 발을 들어올리는 각도 [rad]
+  fold_knee_angle: -2.55
+
   prob_peg_leg: 0.5 # 부상을 적용할 확률
   # target_leg 가 env fixed인 경우 prob_peg_leg를 적용하지 않음
   # 부상이 적용되었다면 환경번호에 따라 정상, 부상 다리를 역할을 고정적으로 결정함
-  target_leg: 'env_fixed' 
+  # (env_fixed 는 부목 presence 토글이 첫 리셋 이후 발생하지 않아 학습 비용도 0)
+  target_leg: 'env_fixed'
   env_fixed_healthy_slots: 4 # 정상다리 갯수
 
   # 부상이 선택됐을 때 적용할 설정
   prob_joint_disabled: 1.0 # 부상 다리가 선택됐을 때 해당 다리의 calf 관절을 실제로 고정할 확률
 
-  # # true: 부상 발에만 샘플 마찰 적용 [환경변수 확인]
-  # # false: 부상 환경의 로봇 전체 shape에 적용
-  injured_foot_friction_only: true
+  # true: 부상 다리의 부목 끝단 shape에만 샘플 마찰 적용
+  # false: 부상 환경의 로봇 전체 shape에 적용 (비권장)
+  injured_splint_friction_only: true
 
-  # curriculum이 꺼져있는 경우 아래 범위로 사용
-  splint_length_range: [0.20, 0.30] # 부목 길이 균등분포 파라미터
-  foot_friction_range: [0.5, 1.5] # 부상 발에 사용할 마찰계수 샘플 범위
+  # curriculum이 꺼져있는 경우 아래 범위로 사용.
+  # ⚠️ 부목 모델 v2: L 은 골반 부착점→끝단 길이. nominal leg reach ≈ 0.31 m 이므로
+  #    0.33 미만은 접지 불가, USD 설계 상한(SPLINT_MAX)은 0.48.
+  splint_length_range: [0.33, 0.45] # 부목 길이 균등분포 파라미터
+  foot_friction_range: [0.5, 1.5] # 부목 끝단에 사용할 마찰계수 샘플 범위
 
-  # 부상 다리 hip 토크 제한 [환경변수 확인]
+  # 부상 다리 hip 토크 제한
   hip_torque:
     scale: 1.0 # 부상 다리에서 선택된 관절의 최대 허용 토크를 정상 대비 몇 배로 할지
     weaken_joints: hip # 부상 다리에서 어떤 관절의 토크를 약화시킬지 "hip", "thigh", "hip,thigh", "thigh,hip"
 
-  # 부상 calf 전용 PD 설정 [환경변수 확인]
+  # 잠긴 calf 전용 PD 설정 (compliant 부목 무릎 — 충격 흡수)
   splint_actuator:
     stiffness: 100.0
     damping: 1.0
@@ -39,19 +47,20 @@ peg_leg:
     leg_probability:
       initial: 0.1
       final: 0.5
-      iterations: 5000 # 증가 함수
+      iterations: 4500 # 증가 함수
 
-    # 부목 길이 확률
+    # 부목 길이 범위 램프: 짧은 부목(≈nominal leg reach, 쉬움)에서 시작해
+    # 긴 부목(키다리, 비대칭 큼)까지 확장
     splint_length:
-      # 초기 부목범위
-      initial_min: 0.28
-      initial_max: 0.33
+      # 초기 부목범위 (쉬움)
+      initial_min: 0.33
+      initial_max: 0.36
 
-      # 후기학습시 부목 범위
-      final_min: 0.20
-      final_max: 0.30
+      # 후기학습시 부목 범위 (전체)
+      final_min: 0.33
+      final_max: 0.45
 
-      iterations: 8000
+      iterations: 6000
     
 # 로봇 Actuator 설정 OK
 actuator:
@@ -93,8 +102,8 @@ command:
     min: 0.10                     # 전진 최소 속도 [m/s]
     max: 1.00                     # 전진 최대 속도 [m/s]
 
-  linear_velocity_y_abs: 0.0      # 좌우 속도 범위 [-값, +값]
-  angular_velocity_yaw_abs: 0.15  # 회전 속도 범위 [-값, +값]
+  linear_velocity_y_abs: 0.3      # 좌우 속도 범위 [-값, +값]
+  angular_velocity_yaw_abs: 0.4  # 회전 속도 범위 [-값, +값]
 
 
 # Observation 설정
@@ -104,10 +113,15 @@ observation:
 
   use_calf_pos_nominal_rel: true
 
+  # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] 을 policy 관측에 추가
+  # (추정기 모듈이 붙기 전까지는 prior 상수 — 차원 예약용)
+  use_rls_estimate: true
+
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
-  privileged: 
-    enabled: true 
+  # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
+  privileged:
+    enabled: true
 
 # Domain Randomization OK
 domain_randomization:
@@ -157,16 +171,16 @@ reward:
   gait_tuning: # 보행 모양과 부드러움을 조정
     enabled: true
     # GO1_FEET_AIR_TIME_WEIGHT
-    feet_air_time_weight: 0.25 # 발이 지면에서 떨어져 공중에 머무르는 시간을 보상 # 0.25 -> 0.5
+    feet_air_time_weight: 0.3 # 발이 지면에서 떨어져 공중에 머무르는 시간을 보상 # 0.25 -> 0.5
 
     # 적용 전 값. 이후 action_rate_penalty_scale=0.5가 곱해져 실제 최종 weight는 -0.025가 됨
-    action_rate_weight: -0.05 # 연속된 두 시점의 action 변화량을 벌점
+    action_rate_weight: -0.1 # 연속된 두 시점의 action 변화량을 벌점
     angular_velocity_xy_weight: -0.1 # 몸통의 roll축과 pitch축 각속도를 억제하기 위한 벌점
 
   energy:
     # 이미 Isaac Lab에 존재하는 페널티의 가중치를 배율로 조정
     # ex # Isaac Lab 기본 -0.0002 × 30 = 실제 최종 -0.006
-    torque_penalty_scale: 30 # 관절 토크가 클수록 페널티가 커짐
+    torque_penalty_scale: 20 # 관절 토크가 클수록 페널티가 커짐
 
     # Isaac Lab 기본 -2.5e-7 × 0.5 = 실제 최종 -1.25e-7
     dof_acc_penalty_scale: 0.5 # 관절 가속도 페널티
@@ -242,8 +256,8 @@ reward:
       weight: -0.02
 
       # 통증 함수
-      failure_force_threshold: 12.0 # 통증이 시작되는 기준
-      pain_scale: 2.0 # 통증이 얼마나 빠르게 증가하는지 결정하는 계수
+      failure_force_threshold: 16.0 # 통증이 시작되는 기준
+      pain_scale: 0.4 # 통증이 얼마나 빠르게 증가하는지 결정하는 계수
       max_exp_argument: 10.0 # pain form의 x상한
       max_penalty: 200.0 # pain form y상한
       
@@ -255,12 +269,14 @@ reward:
       include_calf: true
 
     # 부목 다리를 쓰지 않으면 주는 벌점: 부상 다리를 완전히 들고 걷는 3족 보행 억제
+    # (부목 모델 v2: 하중은 부목 끝단 접촉력으로 측정)
     injured_limb_force_nonuse:
       enabled: true
       weight: -1.0
 
-      # 부상 다리 하중을 계산할 때 발바닥뿐 아니라 calf 링크의 접촉력까지 포함할지를 결정
-      include_calf: true
+      # true 면 발+calf 접촉력도 하중에 합산 (구모델 호환).
+      # v2 에서 발/calf 접촉은 통증(penalty_pain) 대상이므로 false 권장.
+      include_calf: false
 
       min_force_severe: 5.0
       min_force_mild: 5.0
@@ -279,12 +295,11 @@ reward:
     injured_limb_load_duty_nonuse:  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
       enabled: true
       weight: -1.5
-      # 부상 발 힘 > 10 N인 시간을 전체의 35% 이상 만들어라, 그렇지 않으면 벌점
+      # 부목 끝단 힘 > 10 N인 유효 하중 시간이 목표 duty 미만이면 벌점
+      # (severe/mild 기준 길이는 peg_leg.splint_length_range 에서 자동 유도)
       load_contact_threshold: 10.0
-      severe_splint_length: 0.2
-      mild_splint_length: 0.3
-      min_duty_severe: 0.35
-      min_duty_mild: 0.35
+      min_duty_severe: 0.28
+      min_duty_mild: 0.4
       front_leg_multiplier: 1.1
       rear_leg_multiplier: 1.0
       ema_alpha: 0.97

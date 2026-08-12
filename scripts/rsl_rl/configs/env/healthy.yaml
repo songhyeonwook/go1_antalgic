@@ -6,16 +6,21 @@ peg_leg:
   enabled: false
   grace_steps: 10
 
+  # Phase 1도 부목 asset 자체는 동일하게 사용 (presence 전부-없음, 차원 일치용)
+  attach: thigh
+  fold_knee_angle: -2.55
+
   # Phase 1은 모든 환경을 정상 상태로 유지
   prob_peg_leg: 0.0 # 부상을 적용할 확률
   target_leg: env_fixed # 부상이 적용되었다면 어느 다리를 선택할지 결정
 
   # 부상이 선택됐을 때 적용할 설정
   prob_joint_disabled: 1.0 # 부상 다리가 선택됐을 때 해당 다리의 calf 관절을 실제로 고정할 확률
-  actuation_mode: locked
 
-  splint_length_range: [0.20, 0.30] # 부목 길이 균등분포 파라미터
-  foot_friction_range: [0.5, 1.5] # 부상 발에 사용할 마찰계수 샘플 범위
+  injured_splint_friction_only: true
+
+  splint_length_range: [0.33, 0.45] # 부목 길이 균등분포 파라미터
+  foot_friction_range: [0.5, 1.5] # 부목 끝단에 사용할 마찰계수 샘플 범위
 
   curriculum:
     enabled: true
@@ -26,15 +31,15 @@ peg_leg:
       final: 0.5
       iterations: 5000 # 증가 함수
 
-    # 부목 길이 확률
+    # 부목 길이 범위 램프
     splint_length:
-      # 초기 부목범위
-      initial_min: 0.28
-      initial_max: 0.33
+      # 초기 부목범위 (쉬움)
+      initial_min: 0.33
+      initial_max: 0.36
 
-      # 후기학습시 부목 범위
-      final_min: 0.20
-      final_max: 0.30
+      # 후기학습시 부목 범위 (전체)
+      final_min: 0.33
+      final_max: 0.45
 
       iterations: 8000
 
@@ -89,10 +94,14 @@ observation:
 
   use_calf_pos_nominal_rel: true
 
+  # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (Phase 2/3와 차원 일치용)
+  use_rls_estimate: true
+
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
-  privileged: 
-    enabled: true 
+  # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
+  privileged:
+    enabled: true
 
 # Domain Randomization OK
 domain_randomization:
@@ -204,16 +213,9 @@ reward:
       ramp_duration_steps: 6000
   
 
+  # Phase 1은 부상 리워드 미사용 (활성 키 구조는 antalgic.yaml 참고)
   injury:
     enabled: false
-
-    penalty_pain: null  # 부상 다리에 접촉력·과부하가 생길 때 통증 페널티
-    intact_limb_overload: null  # 부상하지 않은 나머지 다리의 과부하 억제
-    injured_limb_force_nonuse: null  # 부상 다리를 완전히 들고 걷는 3족 보행 억제
-    joint_mirror_symmetry: null  # 좌우 대응 관절 자세의 과도한 비대칭 억제
-    injured_limb_load_duty_nonuse: null  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
-    injured_limb_load_duty_overuse: null  # 부상 다리의 유효 하중 시간이 너무 높은 경우
-    injured_limb_light_drag: null  # 부상 다리를 약하게 접촉하며 끄는 행동 억제
 
 
 # 종료 조건

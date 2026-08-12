@@ -11,12 +11,9 @@ from isaaclab_rl.rsl_rl import (
     RslRlDistillationStudentTeacherRecurrentCfg,
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
-    RslRlPpoActorCriticRecurrentCfg,
     RslRlPpoAlgorithmCfg,
-    RslRlSymmetryCfg,
 )
 
-from go1_lab.tasks.manager_based.go1_lab.mdp import mirror
 from go1_lab.tasks.manager_based.go1_lab.mdp import symmetric_ppo  # noqa: F401  registers SymmetricPPO
 
 

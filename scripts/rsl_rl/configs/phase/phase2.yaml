@@ -4,12 +4,13 @@ train:
   agent: rsl_rl_phase2_cfg_entry_point
 
   num_envs: 2048
-  max_iterations: 8000 # 8000, 500
+  max_iterations: 6000 # 8000, 500
   seed: 42
 
 checkpoint:
   mode: "warmstart" # warmstart, resume
-  teacher: /home/unicon/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_07_12_59_40_phase1_s42_P1-005/model_5999.pt
+  #파일을 교체하거나, pc가 바뀌어서 경로가 달라졌을 때, 경로 확인 및 변경
+  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_12_23_51_57_phase1_s42_P1-splint-001/model_4999.pt
   #teacher: /home/unicon/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_08_12_30_08_phase2_s42_P2-001/model_13998.pt
   student: ""
   load_optimizer: false # false, true

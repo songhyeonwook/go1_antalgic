@@ -3,11 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Go1 Lab 환경 설정 - 표준 Go1 Rough 환경을 상속받아 의족(Peg Leg) 시나리오 랜덤화 추가."""
+"""Go1 Lab 환경 설정 - 표준 Go1 Rough 환경을 상속받아 부목(splint) 부상 시나리오 랜덤화 추가.
 
-import os
+부목 모델 v2 요약 (자세한 물리는 mdp/events.py 참고):
+  - 로봇 USD 는 부목 링크 4개 + prismatic 관절 4개가 추가된 변형본
+    (go1_lab.splint.build_cached_splint_usd 가 시작 시 생성)
+  - num_joints=16, action_dim=12 — action/obs 는 12개 다리 관절로 명시 스코핑
+    (부목 관절각 = L 이 그대로 노출되면 privileged 누설이고, 실기에 인코더도 없음)
+  - policy(=student 배포) 관측 그룹에는 실기(Go1)에 존재하는 신호만 남긴다:
+    base_lin_vel 은 privileged 그룹으로 이동
+"""
 
-from isaaclab.actuators import DCMotorCfg
+from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
 from isaaclab.envs import mdp as mdp_base
 from isaaclab.managers import CurriculumTermCfg as CurTerm
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -38,6 +45,7 @@ except ImportError:
 
 from . import mdp
 from .mdp.events import (
+    initialize_splint_presence,
     randomize_peg_leg_actuation,
     peg_leg_curriculum,
     enforce_peg_leg_constraints,
@@ -48,13 +56,19 @@ from .mdp.events import (
 # Environment configuration
 ##
 
+# 정책 action / 관측 / 리셋 이벤트가 다루는 12개 다리 관절 (부목 관절 제외)
+LEG_JOINT_PATTERNS = (".*_hip_joint", ".*_thigh_joint", ".*_calf_joint")
+
+
 @configclass
 class Go1LabPrivilegedObsCfg(ObsGroup):
-    # Teacher에게 제공할 privileged observation 정의
-    #TODO: 이거 mdp에서 어떻게 특권정보 가져오는지 확인
-    peg_leg_one_index = ObsTerm(func=mdp.peg_leg_one_hot) # 부상 다리
-    peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length) # 부목 길이 
-    peg_leg_foot_friction = ObsTerm(func=mdp.peg_leg_foot_friction) # 발 마찰 계수
+    # Teacher/critic 에게만 제공되는 privileged observation (sim 전용 GT)
+    peg_leg_one_index = ObsTerm(func=mdp.peg_leg_one_hot)  # 부상 다리 one-hot(5)
+    peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length)  # 부목 길이 L(1)
+    peg_leg_foot_friction = ObsTerm(func=mdp.peg_leg_foot_friction)  # 부목 끝단 마찰(1)
+    # 실기 Go1 에는 몸통 선속도 측정이 없으므로 policy 그룹에서 제거하고 여기로
+    # 이동 — teacher/critic 은 obs_groups 매핑으로 계속 사용, student 는 못 봄
+    base_lin_vel = ObsTerm(func=mdp_base.base_lin_vel)  # (3)
 
     def __post_init__(self):
         self.enable_corruption = False # priviliged observation noise
@@ -85,6 +99,63 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+    def _apply_splint_asset_settings(self, peg_leg_cfg: dict) -> str:
+        """부목 링크가 추가된 로봇 USD 를 생성해 적용합니다 (전 phase 공통).
+
+        healthy phase 에서도 같은 asset 을 씁니다 — startup 이벤트가 presence 를
+        '전부 없음'(렌더 off + 질량≈0 + 콜라이더 off)으로 두므로 동역학은 순정
+        Go1 과 사실상 동일하고, 관측/액션 차원은 phase 간 완전히 일치합니다.
+
+        ⚠️ 반드시 SimulationApp 실행 이후에 호출되어야 합니다 (USD 빌드가 pxr 의존).
+        """
+        from go1_lab.splint import SPLINT_MIN, build_cached_splint_usd
+
+        attach = str(peg_leg_cfg["attach"]).strip().lower()
+
+        src_usd = self.scene.robot.spawn.usd_path
+        self.scene.robot.spawn.usd_path = build_cached_splint_usd(src_usd, attach=attach)
+        # 부목 관절은 SPLINT_MIN(주차: 끝단이 지면 위에 떠서 접지하지 않음)에서 시작
+        self.scene.robot.init_state.joint_pos[".*_splint_joint"] = SPLINT_MIN
+
+        # startup 에서 presence 를 _peg_leg_index(전부 -1)와 동기화.
+        # 이후 reset 이벤트는 diff 로만 갱신 → env_fixed 학습에서는 토글 비용 0.
+        self.events.init_splint_presence = EventTerm(
+            func=initialize_splint_presence,
+            mode="startup",
+            params={"asset_cfg": SceneEntityCfg("robot"), "attach": attach},
+        )
+        return attach
+
+    def _apply_joint_scope_settings(self) -> None:
+        """action / 관측 / 관절 리셋 이벤트를 12개 다리 관절로 명시 제한합니다.
+
+        부목 관절 4개가 추가되어 num_joints=16 이므로 기본값 ".*" 를 그대로 두면:
+          - action 이 16차원이 되고 (부목은 기구이지 근육이 아님)
+          - 부목 관절각 = L 이 policy 관측에 그대로 노출되며 (privileged 누설,
+            실기에 해당 인코더도 없음)
+          - reset_joints_by_scale 이 부목 관절 주차 위치를 흔들어 놓습니다.
+        """
+        self.actions.joint_pos.joint_names = list(LEG_JOINT_PATTERNS)
+        self.observations.policy.joint_pos.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=list(LEG_JOINT_PATTERNS)
+        )
+        self.observations.policy.joint_vel.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=list(LEG_JOINT_PATTERNS)
+        )
+        if getattr(self.events, "reset_robot_joints", None) is not None:
+            self.events.reset_robot_joints.params["asset_cfg"] = SceneEntityCfg(
+                "robot", joint_names=list(LEG_JOINT_PATTERNS)
+            )
+        # 관절 기반 리워드도 다리 관절로 제한. 부목 prismatic 드라이브의 유지력은
+        # |τ| ~ 1e4 N 스케일이라 (실측), 전 관절 집계 시 dof_torques_l2 가
+        # -1e7/step 로 폭발해 나머지 리워드를 전부 삼켜버린다.
+        for term_name in ("dof_torques_l2", "dof_acc_l2", "dof_pos_limits"):
+            term = getattr(self.rewards, term_name, None)
+            if term is not None:
+                term.params["asset_cfg"] = SceneEntityCfg(
+                    "robot", joint_names=list(LEG_JOINT_PATTERNS)
+                )
+
     def _apply_actuator_settings(self, cfg):
         actuator_type = str(cfg["type"]).strip().lower()
         
@@ -110,25 +181,38 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         ├── lights
         └── 기타 rigid object
         """
-        self.scene.robot.actuators = { 
+        self.scene.robot.actuators = {
             "base_legs": DCMotorCfg(
-                joint_names_expr=[
-                    ".*_hip_joint",
-                    ".*_thigh_joint",
-                    ".*_calf_joint",
-                ],
+                joint_names_expr=list(LEG_JOINT_PATTERNS),
                 effort_limit=effort_limit,
                 saturation_effort=effort_limit,
                 velocity_limit=float(pd_cfg["velocity_limit"]),
                 stiffness=float(pd_cfg["kp"]),
                 damping=float(pd_cfg["kd"]),
                 friction=float(pd_cfg["friction"]),
-            )
+            ),
+            # 부목 prismatic 관절: 학습 대상이 아닌 '기구'. 고강성 드라이브가
+            # per-env joint limit 과 함께 관절을 L 위치에 붙잡는다
+            # (게인은 usd_builder 의 드라이브 설정과 동일, spike 로 오차 <1e-3 m 확인).
+            "splints": ImplicitActuatorCfg(
+                joint_names_expr=[".*_splint_joint"],
+                effort_limit_sim=1.0e6,
+                stiffness=1.0e5,
+                damping=1.0e3,
+            ),
         }
         
     def _apply_simulation_settings(self, cfg: dict) -> None:
         self.scene.replicate_physics = bool(cfg["replicate_physics"])
         self.scene.clone_in_fabric = bool(cfg["clone_in_fabric"])
+
+        # 부목 presence(질량/콜라이더의 env 별 차이)는 프로토타입 복제와 양립 불가.
+        # True 면 조용히 모든 env 에 부목이 남는 잘못된 물리가 되므로 즉시 실패시킨다.
+        if self.scene.replicate_physics:
+            raise ValueError(
+                "splint presence 는 env 별 USD 차이가 필요하므로 "
+                "simulation.replicate_physics=false 여야 합니다."
+            )
 
         gpu_cfg = cfg["gpu"]
 
@@ -208,6 +292,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             if hasattr(self.observations.policy, "height_scan"):
                 self.observations.policy.height_scan = None
 
+        # 실기(Go1)에 몸통 선속도 측정이 없음 → policy(=student 배포) 그룹에서
+        # 제거. teacher/critic 은 Go1LabPrivilegedObsCfg.base_lin_vel 로 계속 봄.
+        self.observations.policy.base_lin_vel = None
+
         privileged_cfg = cfg["privileged"]
 
         if not bool(privileged_cfg["enabled"]):
@@ -218,8 +306,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
 
         # privileged observation group 설정 객체를 생성
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
-        # [FL, FR, RL, RR, injured_flag]
-        
+        # [FL, FR, RL, RR, injured_flag, L, friction, lin_vel(3)]
+
         # 부상 전 nominal 기준의 calf 관절각 4차원 추가
         if bool(cfg["use_calf_pos_nominal_rel"]):
             self.observations.policy.calf_pos_abs = ObsTerm(
@@ -227,6 +315,14 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             )
         else:
             self.observations.policy.calf_pos_abs = None
+
+        # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (2차원).
+        # 지금은 prior 상수를 반환하는 자리표시자 — 추정기 모듈이 붙기 전에
+        # 관측 차원을 미리 고정해 두어 phase 간/추후 체크포인트 호환을 지킨다.
+        if bool(cfg["use_rls_estimate"]):
+            self.observations.policy.rls_estimate = ObsTerm(
+                func=mdp.rls_estimate
+            )
         
     def _apply_domain_randomization_settings(self, cfg) -> None:
         
@@ -431,22 +527,24 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             )
         else:
             self.rewards.penalty_pain = None
-        
-    
-        
-        splint_min, splint_max = peg_leg_cfg['splint_length_range'][0], peg_leg_cfg['splint_length_range'][1]
-        
-        # 부상 다리를 사용하지 않는 것에 대한 패널티 (그걸 지면으로 부터 받는 힘을 측정)
+
+        splint_range = peg_leg_cfg["splint_length_range"]
+        splint_min, splint_max = min(splint_range), max(splint_range)
+        # 부목 모델 v2 의 심각도: nominal leg reach(≈0.31 m)에서 멀수록 어렵다.
+        # 긴 부목(=키다리)일수록 비대칭이 커지므로 severe=최대 길이, mild=최소 길이.
+        severe_len, mild_len = splint_max, splint_min
+
+        # 부상 다리를 사용하지 않는 것에 대한 패널티 (부목 끝단이 지면에서 받는 힘 측정)
         force_cfg = cfg["injured_limb_force_nonuse"]
-        
+
         if force_cfg['enabled']:
             self.rewards.injured_limb_force_nonuse = RewTerm(
                 func=mdp.penalize_injured_limb_force_nonuse, # 부상 다리의 평균 접촉력이 최소 목표보다 부족한지를 계산하는 함수
                 weight=float(force_cfg["weight"]),
                 params={
                     "sensor_name": "contact_forces",
-                    "severe_splint_length": splint_min,
-                    "mild_splint_length": splint_max,
+                    "severe_splint_length": severe_len,
+                    "mild_splint_length": mild_len,
                     "min_force_severe": float(force_cfg['min_force_severe']),
                     "min_force_mild": float(force_cfg['min_force_mild']),
                     "front_leg_multiplier": float(force_cfg["front_leg_multiplier"]),
@@ -458,9 +556,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 },
             )
         else:
-            self.rewards.injured_limb_force_nonuse = True
-                    
-            
+            self.rewards.injured_limb_force_nonuse = None
+
         duty_nonuse_cfg = cfg[
             "injured_limb_load_duty_nonuse"
         ]
@@ -476,9 +573,9 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                         duty_nonuse_cfg["load_contact_threshold"]
                     ),
                     
-                    "severe_splint_length": splint_min,
-                    "mild_splint_length": splint_max,
-                    
+                    "severe_splint_length": severe_len,
+                    "mild_splint_length": mild_len,
+
                     "min_duty_severe": float(
                         duty_nonuse_cfg["min_duty_severe"]
                     ),
@@ -571,7 +668,7 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     "sensor_name": "contact_forces",
                     "force_threshold": float(calf_contact_cfg["force_threshold"]),
                     "max_overload": float(calf_contact_cfg["max_overload"]),
-                    "use_z_only": bool(calf_contact_cfg.get["use_z_only"]),
+                    "use_z_only": bool(calf_contact_cfg["use_z_only"]),
                 },
             )
         else:
@@ -629,7 +726,7 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 },
             )
         else:
-            self.terminations.base_contact = None
+            self.terminations.bad_orientation = None
         
     # domain Random에 의해 덮어짐
     def _apply_payload_settings(self, cfg) -> None:
@@ -790,15 +887,17 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         )
 
          
-    def _apply_peg_leg_event_settings(self, cfg: dict, steps_per_iteration: int, eval_peg_leg:str = None) -> None:
+    def _apply_peg_leg_event_settings(self, cfg: dict, steps_per_iteration: int, attach: str, eval_peg_leg:str = None) -> None:
         # 이벤트 자체를 등록하지 않는 모드
         self.use_peg_leg = bool(cfg["enabled"])
-        
+
         if not self.use_peg_leg:
             self.events.randomize_peg_leg_actuation = None
             self.events.enforce_peg_leg = None
             self.curriculum.peg_leg_difficulty = None
-            
+            # 부상 env 가 없으므로 grace period 불필요 (None 이면 step()에서 비교 불가)
+            self.grace_steps = 0
+
             if eval_peg_leg not in (None, "normal"):
                 raise ValueError(
                     f"peg_leg.enabled=false인 환경에서는 "
@@ -808,17 +907,17 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             return
 
         self.grace_steps = int(cfg['grace_steps'])
-        
+
         if self.grace_steps < 0:
             raise ValueError("grace_steps must be greater than or equal to zero")
-        
-        
-        
+
+
+
         # 기본값은 antalgic.yaml의 학습 설정
         target_leg = str(cfg["target_leg"]).strip().lower()
         prob_peg_leg = max(0.0, min(1.0, float(cfg["prob_peg_leg"])))
-        
-        
+
+
         # test.py에서 평가값을 넘겼다면 평가용으로 덮어쓰기
         target_leg, prob_peg_leg = (
             self._set_target_and_peg_leg_prob_for_eval(
@@ -827,30 +926,30 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 prob_peg_leg=prob_peg_leg,
             )
         )
-            
+
         splint_range = tuple(float(value) for value in cfg["splint_length_range"])
         foot_friction_range = tuple(float(value) for value in cfg["foot_friction_range"])
-        injured_foot_friction_only = bool(cfg["injured_foot_friction_only"])
-        
+        injured_splint_friction_only = bool(cfg["injured_splint_friction_only"])
+
         # 부목길이
         splint_range = (min(splint_range), max(splint_range))
-        
-        # 발 마찰 계수
+
+        # 부목 끝단 마찰 계수
         foot_friction_range = (min(foot_friction_range), max(foot_friction_range))
-        
+
         # 에피소드가 reset될 때 부상 상태와 관련 버퍼 초기화
         # env._peg_leg_index 가 생성됨
         hip_torque_cfg = cfg["hip_torque"]
         hip_torque_scale = float(hip_torque_cfg["scale"])
         weaken_joints = str(hip_torque_cfg["weaken_joints"]).strip().lower()
 
-        
+
         splint_actuator_cfg = cfg["splint_actuator"]
         splint_calf_stiffness = float(splint_actuator_cfg["stiffness"])
         splint_calf_damping = float(splint_actuator_cfg["damping"])
 
         healthy_slots = int(cfg["env_fixed_healthy_slots"])
-        
+
         self.events.randomize_peg_leg_actuation = EventTerm(
             func=randomize_peg_leg_actuation,
             mode="reset",
@@ -861,16 +960,20 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 "prob_joint_disabled":  float(cfg["prob_joint_disabled"]),
                 "splint_length_range": splint_range,
                 "foot_friction_range": foot_friction_range,
-                
-                "injured_foot_friction_only": injured_foot_friction_only,
-                
+
+                "injured_splint_friction_only": injured_splint_friction_only,
+
+                # 부상 무릎 접기 각도 + 부목 부착 링크
+                "fold_knee_angle": float(cfg["fold_knee_angle"]),
+                "attach": attach,
+
                 "hip_torque_scale": hip_torque_scale,
                 "weaken_joints": weaken_joints,
-                
-                # 부상 calf 전용 PD
+
+                # 잠긴 calf 전용 PD (compliant 부목 무릎)
                 "splint_calf_stiffness": splint_calf_stiffness,
                 "splint_calf_damping": splint_calf_damping,
-                
+
                 # 정상 보행을 할 환경 구성 갯수
                 "healthy_slots": healthy_slots,
             },
@@ -895,10 +998,15 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
     def apply_environment_settings(self, settings: dict, steps_per_iteration: int, eval_peg_leg:str =None):
         # phase = str(settings["name"]).strip().lower()
         steps_per_iteration = int(steps_per_iteration)
-        
+
         self.use_peg_leg_action_mask = bool(settings["use_peg_leg_action_mask"])
-        
-        self._apply_peg_leg_event_settings(settings['peg_leg'], steps_per_iteration, eval_peg_leg=eval_peg_leg)
+
+        # 부목 asset 은 전 phase 공통 (healthy 는 presence 전부-없음 상태로 사용)
+        attach = self._apply_splint_asset_settings(settings["peg_leg"])
+        # 부목 관절이 action/관측/리셋에 새어들지 않게 12개 다리 관절로 스코핑
+        self._apply_joint_scope_settings()
+
+        self._apply_peg_leg_event_settings(settings['peg_leg'], steps_per_iteration, attach=attach, eval_peg_leg=eval_peg_leg)
         self._apply_actuator_settings(settings["actuator"])
         self._apply_simulation_settings(settings["simulation"])
         self._apply_command_settings(settings["command"])

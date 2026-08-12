@@ -7,9 +7,7 @@
 
 from __future__ import annotations
 
-import os
 import torch
-from collections.abc import Sequence
 
 from isaaclab.envs import ManagerBasedRLEnv
 
@@ -105,35 +103,30 @@ class Go1LabEnv(ManagerBasedRLEnv):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _mask_peg_leg_action(self, action: torch.Tensor) -> torch.Tensor:
-        """부상 calf joint의 action을 0으로 마스킹합니다.
+        """잠긴 calf joint의 action을 0으로 마스킹합니다.
 
         주 목적은 last_action 관측 일관성입니다 (고정 관절의 action 은 항상 0).
         주의: action offset 은 액션 항 init 시 default_joint_pos 를 clone 한 값이라
         action=0 이 lock 목표를 만들지는 않습니다 — 실제 고정은
         _enforce_peg_leg_joint_targets 의 target 덮어쓰기 + PD 가 담당합니다.
+
+        ⚠️ 인덱스 공간: 부목 관절 4개가 추가되어 num_joints(16) ≠ action_dim(12)
+        이므로 반드시 action-index 버퍼(_peg_leg_calf_action_index)를 씁니다.
+        joint index 를 action 버퍼에 그대로 쓰면 엉뚱한 관절이 마스킹됩니다.
         """
-        if not hasattr(self, "_peg_leg_index"):
+        if not hasattr(self, "_peg_leg_calf_action_index"):
             return action
 
-        peg_idx = self._peg_leg_index  # (num_envs,) -1=정상, 0~3=부상
-        is_injured = peg_idx >= 0
-        if not is_injured.any():
+        locked = self._peg_leg_lock_active
+        if not locked.any():
             return action
 
         action = action.clone()  # 원본 수정 방지
-        injured_envs = torch.where(is_injured)[0]
-        # ⚠️ Go1 joint order is PER-TYPE ([..hips.., ..thighs.., ..calves..]),
-        # NOT per-leg, so the calf action index is NOT leg_idx*3+2 — that froze a
-        # DIFFERENT leg's joint (e.g. an RL injury masked FL_calf, killing a front
-        # leg → the robot could not walk). Use the real calf joint index (resolved
-        # by name in events.py), matching _enforce_peg_leg_joint_targets.
-        if hasattr(self, "_peg_leg_calf_joint_index"):
-            calf_action_idx = self._peg_leg_calf_joint_index[injured_envs]
-            valid = calf_action_idx >= 0
-            action[injured_envs[valid], calf_action_idx[valid]] = 0.0
-        # else: 이름 기반 인덱스가 없으면 마스킹을 건너뜁니다. per-leg 공식
-        # (leg*3+2) 은 per-TYPE 순서에서 엉뚱한 healthy 관절을 죽이므로, 잘못된
-        # 마스킹보다 no-op 가 안전합니다 (_ensure_peg_leg_buffers 이후에는 항상 존재).
+        locked_envs = torch.where(locked)[0]
+        calf_action_idx = self._peg_leg_calf_action_index[locked_envs]
+        valid = (calf_action_idx >= 0) & (calf_action_idx < action.shape[1])
+        if valid.any():
+            action[locked_envs[valid], calf_action_idx[valid]] = 0.0
         return action
 
     def _enforce_peg_leg_joint_targets(self) -> None:
@@ -145,19 +138,18 @@ class Go1LabEnv(ManagerBasedRLEnv):
         계산하므로 스푸핑되어 홀딩 토크가 0 이 됩니다 (실측: 부상 calf 0.00 Nm vs
         정상 4.74 Nm, 관절이 lock 에서 평균 0.81 rad 이탈해 무릎이 접혔음).
         """
-        if not hasattr(self, "_peg_leg_index"):
+        if not hasattr(self, "_peg_leg_lock_active"):
             return
 
-        peg_idx = self._peg_leg_index
-        is_injured = peg_idx >= 0
-        if not is_injured.any():
+        locked = self._peg_leg_lock_active & (self._peg_leg_calf_joint_index >= 0)
+        if not locked.any():
             return
 
         robot = self.scene["robot"]
-        injured_envs = torch.where(is_injured)[0]
-        calf_joints = self._peg_leg_calf_joint_index[injured_envs]
-        lock_angles = self._peg_leg_calf_lock_angle[injured_envs]
+        locked_envs = torch.where(locked)[0]
+        calf_joints = self._peg_leg_calf_joint_index[locked_envs]
+        lock_angles = self._peg_leg_calf_lock_angle[locked_envs]
 
         # joint_pos_target을 lock angle로 강제
         if hasattr(robot.data, "joint_pos_target") and robot.data.joint_pos_target.ndim >= 2:
-            robot.data.joint_pos_target[injured_envs, calf_joints] = lock_angles
+            robot.data.joint_pos_target[locked_envs, calf_joints] = lock_angles

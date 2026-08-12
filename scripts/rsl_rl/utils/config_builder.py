@@ -44,7 +44,6 @@ class ExperimentConfig:
     environment: EnvironmentConfig
     checkpoint: CheckpointConfig
     common: dict[str, Any]
-    curriculum: dict[str, Any] | None
     evaluation: EvaluationConfig
     exploration: ExplorationConfig
     rsl_logger: str = "tensorboard"
@@ -204,7 +203,6 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
         environment=environment_cfg,
         checkpoint=checkpoint_cfg,
         common=common_cfg,
-        curriculum=phase_cfg.get("curriculum"),
         evaluation=evaluation_cfg,
         exploration=exploration_cfg,
         rsl_logger=common_cfg.get("rsl_logger", "tensorboard"),

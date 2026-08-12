@@ -3,12 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Python module serving as a project/extension template.
-"""
+"""Go1 부목(splint) 부상 적응 보행 학습 확장 패키지."""
 
 # Register Gym environments.
 from .tasks import *
-
-# Register UI extensions.
-from .ui_extension_example import *
