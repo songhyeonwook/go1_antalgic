@@ -106,7 +106,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         '전부 없음'(렌더 off + 질량≈0 + 콜라이더 off)으로 두므로 동역학은 순정
         Go1 과 사실상 동일하고, 관측/액션 차원은 phase 간 완전히 일치합니다.
 
-        ⚠️ 반드시 SimulationApp 실행 이후에 호출되어야 합니다 (USD 빌드가 pxr 의존).
         """
         from go1_lab.splint import SPLINT_MIN, build_cached_splint_usd
 

@@ -16,8 +16,6 @@
                   못하므로 thigh 관절도 함께 잠가야 물리적으로 일관된다.
                   전후 스윙이 불가능한 강체 지팡이(진짜 peg leg).
 
-⚠️ pxr 의존은 함수 내부 lazy import — 함수 호출은 반드시 SimulationApp
-   인스턴스화 이후에 할 것. (test/ 스파이크에서 검증 후 승격된 모듈.)
 """
 
 from __future__ import annotations

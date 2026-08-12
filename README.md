@@ -1,3 +1,5 @@
+#splint-v2 branch
+
 # Antalgic Reinforcement Learning for the Peg-Leg Problem (Unitree Go1)
 
 Code accompanying *"Antalgic reinforcement learning solves the peg-leg problem and

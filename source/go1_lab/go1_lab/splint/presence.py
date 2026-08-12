@@ -1,27 +1,3 @@
-"""부목을 다리별로 '있게/없게' 만드는 런타임 헬퍼 (test/ 스파이크에서 검증 후 승격).
-
-⚠️ 전제: 부목 링크 자체는 지울 수 없다.
-   Isaac Lab 의 Articulation 텐서 API 는 모든 env 의 링크/관절 수와 이름이
-   같아야 성립한다. MultiUsdFileCfg 로 변형을 나눠도 이 제약은 동일하므로,
-   "정상 조건에도 부목 링크가 존재해야 한다"는 피할 수 없다.
-
-그래서 없애는 것은 링크가 아니라 그 링크의 '효과'다. 세 층 모두 런타임에
-양방향 토글된다 (test/spike_runtime_collider_toggle.py 로 실측 확인):
-
-  1) 렌더      visibility          → 순수 렌더링 속성. 물리 무관.
-  2) 동역학    mass/inertia        → 중력/관성 기여.
-  3) 접촉      collisionEnabled    → 접촉 이벤트 자체.
-                                     ★ replicate_physics=False 필수.
-                                       True 면 프로토타입 하나가 복제되어
-                                       env 별 차이를 만들 수 없다.
-
-남는 것(못 없애는 것):
-  - prismatic 관절 자유도: joint_pos/joint_vel 텐서에 계속 존재
-    → observation / action term 에서 이름으로 제외해야 한다.
-  - ContactSensor 의 body 채널: 계속 존재 (값은 0).
-  - PhysX 가 그 DOF 를 계속 푼다 (비용은 미미).
-"""
-
 from __future__ import annotations
 
 import torch

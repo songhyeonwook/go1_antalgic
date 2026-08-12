@@ -3,42 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""이벤트 함수들 - 부목(splint) 부상 시나리오 랜덤화.
-
-물리 모델 (v2 — 실제 부목 링크, test/ 스파이크에서 검증 후 승격):
-  이전 버전은 calf 관절각을 역기구학으로 "등가 부목 길이"로 재해석하는 근사였다.
-  그 모델에서는 L 이 관절 인코더에 그대로 드러나(L=fk(q_calf), r≈0.999) 추정
-  문제가 자명해진다. 현재 버전은 USD 에 실제 부목 링크를 둔다:
-
-    골반 옆 부착점 ──[prismatic]── {leg}_splint (막대 + 끝단 접촉구)
-
-    (1) 부목은 부상 다리에만 "존재" — set_splint_presence 가 렌더/질량/콜라이더를
-        토글한다. env 별 차이가 필요하므로 replicate_physics=False 필수.
-    (2) 부목 길이 L = prismatic 관절 위치. per-env joint limit 으로 잠근다.
-        L 은 관측 그룹 어디에도 넣지 않는다 (실기에 인코더가 없음) —
-        접촉/동역학 이력으로만 추정 가능해야 한다.
-    (3) 부상 무릎(calf)은 fold_knee_angle 로 접어 발을 들어올린다.
-        발 대신 부목 끝단으로 접지한다.
-    (4) 샘플된 마찰계수는 부목 끝단 collision sphere 에 적용한다.
-
-⚠️ 핵심 설계 원칙 (explicit actuator 호환):
-  Go1 은 explicit actuator(DCMotor PD)를 사용하므로 PhysX 내부 PD 는 비활성이다.
-  robot.data.joint_stiffness 에 값을 써도 물리 효과가 없다. calf 관절을
-  "고정"하려면:
-    (1) default_joint_pos 를 fold 각으로 설정 (joint_pos_rel 관측 소거용)
-    (2) 매 스텝 action masking: 부상 calf 의 action 을 0 으로 강제
-    (3) 리셋 시 write_joint_state_to_sim 으로 실제 관절 상태를 fold 각에 배치
-    (4) 매 physics sub-step 마다 joint_pos_target 을 fold 각으로 덮어쓰기
-  관절을 붙잡는 힘은 PD 액추에이터가 낸다. robot.data.joint_pos 에 직접 대입하면
-  안 된다 — PhysX 읽기 캐시라 sim 에 안 써지고 PD 오차 계산만 스푸핑된다.
-
-⚠️ 인덱스 공간 주의:
-  부목 관절 4 개가 추가되어 num_joints=16 인 반면 action_dim=12 (다리 관절만).
-  joint index 와 action index 가 더 이상 같은 공간이 아니다.
-    - joint_pos_target / write_joint_state_to_sim → _peg_leg_calf_joint_index
-    - action 버퍼 마스킹                          → _peg_leg_calf_action_index
-"""
-
 from __future__ import annotations
 
 import math

@@ -47,7 +47,7 @@ class Go1LabEnv(ManagerBasedRLEnv):
             self._sim_step_counter += 1
             # set actions into buffers
             self.action_manager.apply_action()
-            # ⭐ 부상 calf joint의 target을 lock angle로 강제 덮어쓰기
+            # 부상 calf joint의 target을 lock angle로 강제 덮어쓰기
             self._enforce_peg_leg_joint_targets()
             # set actions into simulator
             self.scene.write_data_to_sim()
@@ -66,7 +66,7 @@ class Go1LabEnv(ManagerBasedRLEnv):
         self.reset_terminated = self.termination_manager.terminated
         self.reset_time_outs = self.termination_manager.time_outs
 
-        # ⭐ Grace Period: 부상 환경은 처음 10스텝 동안 높이 종료 비활성화
+        #  Grace Period: 부상 환경은 처음 10스텝 동안 높이 종료 비활성화
         # 다리가 짧아진 직후 정책이 적응할 시간을 줍니다.
         if hasattr(self, "_peg_leg_index"):
             is_injured = self._peg_leg_index >= 0
@@ -103,17 +103,8 @@ class Go1LabEnv(ManagerBasedRLEnv):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _mask_peg_leg_action(self, action: torch.Tensor) -> torch.Tensor:
-        """잠긴 calf joint의 action을 0으로 마스킹합니다.
-
-        주 목적은 last_action 관측 일관성입니다 (고정 관절의 action 은 항상 0).
-        주의: action offset 은 액션 항 init 시 default_joint_pos 를 clone 한 값이라
-        action=0 이 lock 목표를 만들지는 않습니다 — 실제 고정은
-        _enforce_peg_leg_joint_targets 의 target 덮어쓰기 + PD 가 담당합니다.
-
-        ⚠️ 인덱스 공간: 부목 관절 4개가 추가되어 num_joints(16) ≠ action_dim(12)
-        이므로 반드시 action-index 버퍼(_peg_leg_calf_action_index)를 씁니다.
-        joint index 를 action 버퍼에 그대로 쓰면 엉뚱한 관절이 마스킹됩니다.
-        """
+        #잠긴 calf joint의 action을 0으로 마스킹합니다.
+        
         if not hasattr(self, "_peg_leg_calf_action_index"):
             return action
 
@@ -130,14 +121,8 @@ class Go1LabEnv(ManagerBasedRLEnv):
         return action
 
     def _enforce_peg_leg_joint_targets(self) -> None:
-        """apply_action() 후, write_data_to_sim() 전에 부상 calf 의 target 을 lock angle 로 강제합니다.
-
-        이것이 부목 고정의 주 경로입니다: PD 가 target 오차를 보고 관절을 붙잡습니다.
-        ⚠️ 측정값(robot.data.joint_pos/joint_vel)에 대입하는 방식은 금지 — 그 버퍼는
-        PhysX 읽기 캐시라 sim 에 전달되지 않고, 액추에이터가 바로 그 캐시로 PD 오차를
-        계산하므로 스푸핑되어 홀딩 토크가 0 이 됩니다 (실측: 부상 calf 0.00 Nm vs
-        정상 4.74 Nm, 관절이 lock 에서 평균 0.81 rad 이탈해 무릎이 접혔음).
-        """
+        #apply_action() 후, write_data_to_sim() 전에 부상 calf 의 target 을 lock angle 
+        
         if not hasattr(self, "_peg_leg_lock_active"):
             return
 

@@ -25,16 +25,8 @@ if TYPE_CHECKING:
 
 
 def _peg_leg_index_per_env(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """각 env의 고장 다리 인덱스(-1, 0..3)를 반환합니다.
-
-    ⚠️ 중요: Phase1 healthy 학습에서는 `randomize_peg_leg_actuation` 이벤트가 등록되지
-    않아 `env._peg_leg_index` 버퍼가 생성되지 않습니다. 과거의 `env_id % 5` fallback은
-    80% env 를 부상 처리하여 `reward_trot_synchronization` 등 정상 env 전용 보상을
-    대부분의 env에서 꺼버리는 심각한 버그를 유발했습니다.
-
-    새 fallback: 버퍼가 없으면 "모두 정상(-1)" 으로 간주합니다. Phase2/3 에서는 reset
-    이벤트가 버퍼를 생성·갱신하므로 이 경로는 healthy 에서만 쓰입니다.
-    """
+    #각 env의 고장 다리 인덱스(-1, 0..3)를 반환합니다.
+    
     if hasattr(env, "_peg_leg_index"):
         return env._peg_leg_index.to(device=env.device, dtype=torch.long)
     return torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
@@ -192,6 +184,46 @@ def _splint_force_tensor(
     return forces
 
 
+def penalize_peg_leg_contact(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+    sensor_name: str = "contact_forces",
+    force_threshold: float = 0.0,
+    max_overload: float = 120.0,
+    use_z_only: bool = False,
+) -> torch.Tensor:
+    """
+    의족 다리에 접촉력이 가해지는 것을 패널티로 처리합니다.
+    
+    환경 ID를 기준으로 의족 다리를 식별합니다:
+    - 0: 정상
+    - 1: FL 의족 (idx 0)
+    - 2: FR 의족 (idx 1)
+    - 3: RL 의족 (idx 2)
+    - 4: RR 의족 (idx 3)
+    
+    Args:
+        env: ManagerBasedRLEnv 인스턴스
+        asset_cfg: 로봇 자산 설정
+        sensor_name: ContactSensor 이름 (기본: contact_forces)
+        force_threshold: 이 값 이하의 힘은 패널티를 주지 않습니다. (N 단위)
+        use_z_only: True면 z성분(|Fz|)만 사용(근사 GRF), False면 벡터 노름(||F||) 사용
+        
+    Returns:
+        의족 다리 접촉력에 대한 패널티 (접촉력이 클수록 큰 패널티)
+    """
+    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    _ = asset_cfg
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    for leg in range(4):
+        mask = peg_leg_idx == leg
+        if mask.any():
+            overload = torch.clamp(contact_by_foot[mask, leg] - float(force_threshold), min=0.0)
+            penalty[mask] = torch.clamp(overload, max=float(max_overload))
+    return penalty
+
+
 def penalize_knee_shin_contact(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,
@@ -214,6 +246,95 @@ def penalize_knee_shin_contact(
     return penalty
 
 
+def penalize_peg_leg_torque(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """부상 다리 관절(hip/thigh/calf) 토크 제곱합 패널티.
+
+    ⚠️ 이전 구현은 per-leg 순서(leg*3+k)를 가정해 per-TYPE 순서인 실제 관절
+    배열에서 엉뚱한 다리를 패널티했습니다. 이름으로 리졸브해 수정했습니다.
+    (현재 어떤 설정에서도 등록되지 않는 라이브러리 함수입니다.)
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    torques = torch.square(robot.data.applied_torque)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    joint_names = list(robot.data.joint_names)
+
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    for i in range(4):  # 0:FL, 1:FR, 2:RL, 3:RR
+        peg_mask = peg_leg_idx == i
+        if not peg_mask.any():
+            continue
+        leg_joint_ids = [
+            joint_names.index(name)
+            for name in (HIP_JOINT_NAMES[i], THIGH_JOINT_NAMES[i], CALF_JOINT_NAMES[i])
+            if name in joint_names
+        ]
+        penalty[peg_mask] += torch.sum(torques[peg_mask][:, leg_joint_ids], dim=1)
+    return penalty
+
+
+def reward_peg_leg_foot_clearance(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+    target_height: float = 0.1,
+) -> torch.Tensor:
+    """
+    의족 다리를 지면에서 일정 높이 이상 들어 올리면 보상을 줍니다.
+    
+    통증 패널티를 피하기 위해 다리를 들어야 한다는 것을 로봇에게 가이드(Shaping Reward)합니다.
+    의족 다리의 발 높이가 target_height보다 높을수록 보상이 커집니다.
+    
+    Args:
+        env: ManagerBasedRLEnv 인스턴스
+        asset_cfg: 로봇 자산 설정
+        target_height: 목표 높이 (m). 이보다 낮으면 보상이 적거나 0임.
+        
+    Returns:
+        의족 다리 높이 보상
+    """
+    # 로봇 자산 가져오기
+    robot: Articulation = env.scene[asset_cfg.name]
+    
+    # 발 위치 가져오기 (World Frame)
+    # Go1의 발 body 인덱스를 알아야 함.
+    # 여기서는 고정된 인덱스 또는 body 이름 검색 사용
+    # body_names: ['trunk', 'FL_hip', 'FL_thigh', 'FL_calf', 'FL_foot', ...]
+    
+    reward = torch.zeros(env.num_envs, device=env.device)
+    
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    
+    # 발 이름 정의 (Go1 기준)
+    foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+    
+    for i, foot_name in enumerate(foot_names):
+        peg_mask = peg_leg_idx == i
+        
+        if peg_mask.any():
+            try:
+                # 해당 발의 body 인덱스 찾기
+                body_idx = robot.find_bodies(foot_name)[0][0] # (num_bodies,) 인덱스 반환
+                
+                # 발 위치 (env_idx, body_idx, 3) -> (peg_mask_count, 3)
+                # robot.data.body_pos_w는 (num_envs, num_bodies, 3)
+                foot_pos_z = robot.data.body_pos_w[peg_mask, body_idx, 2]
+                
+                # 지면 높이(0.0) 기준으로 높이 계산
+                # (지형이 평평하지 않다면 지형 높이를 빼야 하지만, 일단 평지 가정)
+                
+                # 목표 높이보다 높으면 보상 (Tanh로 상한선 둠)
+                # 높이가 0이면 0점, target_height면 약 0.76점, 그 이상이면 1.0점에 수렴
+                height_error = foot_pos_z / target_height
+                reward[peg_mask] += torch.tanh(height_error)
+                
+            except Exception:
+                pass
+                
+    return reward
+
+
 def reward_trot_synchronization(
     env: "ManagerBasedRLEnv",
     sensor_name: str = "contact_forces",
@@ -232,10 +353,6 @@ def reward_trot_synchronization(
 
     Pronking 방지: 4발이 모두 같은 상태(전부 접지 or 전부 체공)이면 점수 0.
 
-    ⚠️ 속도 명령 게이팅 (v3 → v4): 이 보상이 너무 강하면 로봇이 **제자리에서**만
-    trot 리듬을 타서 터레인 커리큘럼이 0 으로 수렴하는 "trot-in-place" 국소최적이
-    발생합니다. 속도 명령 크기 ||v_cmd|| 가 작을 때는 보상을 서서히 줄여서,
-    "움직이면서 trot" 해야만 보상을 받게 유도합니다:
 
         gate = tanh(sharpness · max(||v_cmd|| - gate_threshold, 0))
     """
@@ -349,6 +466,35 @@ def penalize_duty_factor_asymmetry(
     return penalty
 
 
+def penalize_front_rear_load_imbalance(
+    env: "ManagerBasedRLEnv",
+    sensor_name: str = "contact_forces",
+    min_rear_to_front_ratio: float = 0.45,
+    use_z_only: bool = True,
+    ema_alpha: float = 0.995,
+    ramp_start_steps: int = 0,
+    ramp_duration_steps: int = 1,
+) -> torch.Tensor:
+    """앞다리만 쓰는 전방 크롤링/엎드림 해를 억제합니다.
+
+    앞쪽 CoM이면 front load > rear load는 자연스럽습니다. 하지만 rear load가 front load에
+    비해 거의 0에 가까워지면 정상 보행이 아니라 앞다리만 끌고 가는 실패 모드입니다.
+
+    정상 env에만 적용하고, peg-leg env에서는 자연스러운 하중 재분배를 허용합니다.
+    """
+    contact_by_foot = _foot_force_ema(env, sensor_name=sensor_name, use_z_only=use_z_only, ema_alpha=ema_alpha)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    is_normal = peg_leg_idx < 0
+
+    front_load = contact_by_foot[:, 0] + contact_by_foot[:, 1]
+    rear_load = contact_by_foot[:, 2] + contact_by_foot[:, 3]
+    missing_rear_load = torch.clamp(float(min_rear_to_front_ratio) * front_load - rear_load, min=0.0)
+
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    penalty[is_normal] = missing_rear_load[is_normal] * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
+    return penalty
+
+
 def penalize_front_rear_load_distribution(
     env: "ManagerBasedRLEnv",
     sensor_name: str = "contact_forces",
@@ -421,6 +567,109 @@ def penalize_diagonal_load_asymmetry(
     return penalty
 
 
+def penalize_duty_factor_deviation(
+    env: "ManagerBasedRLEnv",
+    sensor_name: str = "contact_forces",
+    contact_threshold: float = 1.0,
+    target_contact_count: float = 2.0,
+    use_z_only: bool = True,
+) -> torch.Tensor:
+    """Trot 의 "동시에 두 다리만 접지" 특성을 per-step 페널티로 유도합니다.
+
+    매 timestep 의 접지 합(sum of in_contact_i)이 `target_contact_count` (기본 2) 에서
+    얼마나 벗어났는지를 페널티로 반환합니다.
+
+    - 4발 접지(stand)  → |4 - 2| = 2
+    - 3발 접지         → |3 - 2| = 1
+    - 2발 접지 (trot) → |2 - 2| = 0  ✓
+    - 1발 접지         → |1 - 2| = 1
+    - 공중(pronk)      → |0 - 2| = 2
+
+    이전 구현(leg 별 |0/1 - 0.5| 합)은 수학적으로 상수 2.0 이라 학습 신호가 전혀 없었습니다.
+    새 구현은 "2-legs stance" 를 능동적으로 유도합니다. `reward_trot_synchronization` 은
+    어느 대각쌍이 접지하는지를 결정해주고, 이 항은 "몇 개가 동시 접지" 인지를 결정합니다.
+    """
+    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    is_normal = peg_leg_idx < 0
+
+    in_contact = (contact_by_foot > float(contact_threshold)).float()  # (E, 4)
+    total_contact = in_contact.sum(dim=1)  # (E,)
+    dev = torch.abs(total_contact - float(target_contact_count))  # (E,)
+
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    penalty[is_normal] = dev[is_normal]
+    return penalty
+
+
+def penalize_leg_duty_factor_targets(
+    env: "ManagerBasedRLEnv",
+    sensor_name: str = "contact_forces",
+    contact_threshold: float = 1.0,
+    target_duty: tuple[float, float, float, float] = (0.55, 0.55, 0.50, 0.50),
+    tolerance: float = 0.03,
+    use_z_only: bool = True,
+    ema_alpha: float = 0.995,
+    ramp_start_steps: int = 0,
+    ramp_duration_steps: int = 1,
+) -> torch.Tensor:
+    """정상 보행의 다리별 duty factor를 목표 범위로 유도합니다.
+
+    기존 `penalize_duty_factor_asymmetry` 는 좌우 차이만 줄입니다. 따라서
+    FL/FR 이 둘 다 과도하게 오래 접지하는 front-heavy gait는 남을 수 있습니다.
+    이 항은 각 다리의 시간평균 duty가 목표값 주변에 머물도록 하여,
+    force symmetry는 유지하면서 front duty over-stance를 줄이는 데 사용합니다.
+    """
+    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
+    in_contact = (contact_by_foot > float(contact_threshold)).float()
+    alpha = float(max(0.0, min(0.9999, ema_alpha)))
+
+    ema = getattr(env, "_go1_foot_contact_target_ema", None)
+    if ema is None or ema.shape != in_contact.shape:
+        ema = in_contact.detach().clone()
+    else:
+        reset_buf = getattr(env, "reset_buf", None)
+        if reset_buf is not None:
+            reset_mask = reset_buf.to(device=env.device, dtype=torch.bool)
+            if reset_mask.shape[0] == ema.shape[0] and reset_mask.any():
+                ema[reset_mask] = in_contact.detach()[reset_mask]
+        ema.mul_(alpha).add_(in_contact.detach(), alpha=1.0 - alpha)
+
+    env._go1_foot_contact_target_ema = ema
+
+    target = torch.tensor(target_duty, device=env.device, dtype=ema.dtype).view(1, 4)
+    dev = torch.clamp(torch.abs(ema - target) - float(tolerance), min=0.0).sum(dim=1)
+
+    peg_leg_idx = _peg_leg_index_per_env(env)
+    is_normal = peg_leg_idx < 0
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    penalty[is_normal] = dev[is_normal] * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
+    return penalty
+
+
+def penalize_injured_leg_stance_ratio(
+    env: "ManagerBasedRLEnv",
+    sensor_name: str = "contact_forces",
+    contact_threshold: float = 1.0,
+    use_z_only: bool = True,
+) -> torch.Tensor:
+    """부상 다리가 접지 중(duty)이면 패널티를 주어 duty factor를 낮춥니다.
+
+    매 스텝 부상 다리의 접지 여부를 0/1로 판단하고,
+    접지 중이면 패널티를 부여하여 부상 다리를 빨리 들어 올리도록 유도합니다.
+    """
+    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    for leg in range(4):
+        mask = peg_leg_idx == leg
+        if mask.any():
+            in_contact = (contact_by_foot[mask, leg] > float(contact_threshold)).float()
+            penalty[mask] = in_contact
+    return penalty
+
+
 def penalty_pain(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,
@@ -443,62 +692,7 @@ def penalty_pain(
     scale_severe_multiplier: float = 1.25,
     scale_mild_multiplier: float = 0.85,
 ) -> torch.Tensor:
-    """Nociceptor-inspired pain penalty — implements paper equation (4).
 
-    Paper formulation (Section 4.4):
-        Cpain(Fz) = Pbase × 1[contact] + max(0, exp(α(Fz − Fth)) − 1)
-
-    where
-        Pbase  = base_contact_cost         (paper default 0.05)
-        Fth    = failure_force_threshold   (paper default 10.0 N)
-        α      = pain_scale                (paper default 2.0)
-
-    Biological accuracy:
-        • Sub-threshold (Fz < Fth): only Pbase penalty per contact step.
-          Mirrors the low-level baseline firing of biological nociceptors
-          during non-damaging mechanical contact.
-        • Supra-threshold (Fz > Fth): exponential penalty that becomes
-          rapidly intolerable. Mirrors the A-δ and C-fibre burst firing
-          triggered by tissue-damaging loads — the same mechanism that
-          drives antalgic gait in injured animals.
-        • The gradient dCpain/dFz = α·exp(α(Fz−Fth)) is continuous and
-          zero at threshold, removing the discontinuity of a hard barrier.
-
-    Severity scaling (when severity_scaled=True):
-        Shorter/more-damaged splints receive a lower Fth and higher α,
-        reflecting the biological observation that injured tissue has a
-        reduced mechanical pain threshold (peripheral sensitisation).
-        base_contact_cost is also severity-scaled so that severe splints
-        carry higher baseline contact cost, creating the severity trend
-        required by the paper's biomechanical comparison protocol.
-
-    Normal-gait symmetry and mirror injury symmetry:
-        This function applies only to the designated injured leg.
-        Because FL/FR are treated with identical parameter values,
-        the injury response is automatically mirror-symmetric, provided
-        the healthy baseline gait (Phase 1) has no left-right bias.
-
-    Leg force aggregation:
-        leg_force = |Fz(foot)| [+ |Fz(calf)| if include_calf]
-        Including calf naturally prevents knee-walking exploits.
-        부목 모델 v2: 부목 끝단({leg}_splint) 접촉은 여기 포함하지 않습니다 —
-        부목으로 딛는 것은 정상적인 하중 경로(무통)이고, 들려 있어야 할 발이나
-        calf 가 지면에 닿는 것만 통증입니다.
-
-    Args:
-        failure_force_threshold: Fth — pain onset threshold (N).
-            Below this value only Pbase applies (sub-threshold).
-        pain_scale: α — exponential steepness above threshold.
-            Higher values create a sharper nociceptor-like response.
-        base_contact_cost: Pbase — per-contact-step baseline penalty.
-            Discourages persistent stance at sub-threshold force.
-        base_contact_cost_severe/mild_multiplier: severity scaling of
-            Pbase. Severe splints carry higher contact cost, driving
-            the severity trend in force reduction.
-        
-        include_calf: if True, add calf contact force to leg_force
-            to prevent the knee-walking exploit.
-    """
     _ = asset_cfg
     contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=True)
     if include_calf:
@@ -609,21 +803,7 @@ def penalize_injured_limb_force_nonuse(
     ramp_duration_steps: int = 8000,
     include_calf: bool = True,
 ) -> torch.Tensor:
-    """Penalize complete injured-limb non-use while still allowing unloading.
-
-    This is the minimal "use the limb" term: pain alone makes the optimal policy
-    abandon the injured limb and walk as a tripod (non-use is the robust global
-    optimum because any contact costs Pbase and a quadruped is statically stable
-    on three legs). This term enforces only the *premise* of the splint problem —
-    the damaged limb must still bear a minimum residual load (a viability/use
-    floor) — and leaves *how* it is used (force magnitude, duty, asymmetry, CoM
-    shift) to emerge from the pain penalty.
-
-    부목 모델 v2: 부상 다리의 하중 경로는 부목 끝단({leg}_splint 링크)이므로
-    하중은 splint 접촉력으로 측정합니다. include_calf=True 는 발+calf 접촉력도
-    하중에 합산하는 구모델 호환 옵션인데, v2 에서는 발/calf 접촉이 통증
-    (penalty_pain) 대상이므로 하중으로 이중 계상하지 않도록 False 를 권장합니다.
-    """
+ 
     contact_by_leg = _splint_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
     if include_calf:
         contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
@@ -795,3 +975,37 @@ def penalize_joint_mirror_asymmetry(
     q = asset.data.joint_pos[:, leg_ids]
     qm = mirror_joint_tensor(q)
     return torch.sum((q - qm) ** 2, dim=-1)
+
+
+# 발을 끄는 것에 대한 패널티가 아님. 접촉하는 것에 대한 패널티
+def penalize_injured_limb_light_drag(
+    env: "ManagerBasedRLEnv",
+    sensor_name: str = "contact_forces",
+    contact_threshold: float = 1.0,
+    load_contact_threshold: float = 10.0,
+    use_z_only: bool = True,
+    ramp_start_steps: int = 1000,
+    ramp_duration_steps: int = 8000,
+) -> torch.Tensor:
+    """Penalize injured-limb toe dragging/light contact without support.
+
+    A high raw contact duty with low load-bearing duty makes the foot look like it
+    is dragging or skimming the ground. This term penalizes contact in the
+    interval (contact_threshold, load_contact_threshold), while allowing genuine
+    load-bearing contacts that contribute residual support.
+    """
+    contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
+    peg_leg_idx = _peg_leg_index_per_env(env)
+
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    for leg in range(4):
+        mask = peg_leg_idx == leg
+        if not mask.any():
+            continue
+        injured_force = contact_by_foot[mask, leg]
+        light_drag = (
+            (injured_force > float(contact_threshold))
+            & (injured_force < float(load_contact_threshold))
+        ).float()
+        penalty[mask] = light_drag
+    return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
