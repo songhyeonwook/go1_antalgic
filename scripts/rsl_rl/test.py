@@ -37,6 +37,14 @@ parser.add_argument( "--fixed_yaw", type=float, default=None, help="고정 yaw �
 parser.add_argument( "--clean", action="store_true", help="마찰·질량 랜덤화, push, 관측 노이즈를 끄고 기본 보행만 확인",)
 parser.add_argument("--peg_leg", type=str, choices=("normal", "fl", "fr", "rl", "rr", "balanced"), default=None, help="YAML의 eval.peg_leg를 임시로 덮어쓸 평가 조건",)
 parser.add_argument(
+    "--splint_length",
+    type=float,
+    nargs="+",
+    default=None,
+    metavar="L",
+    help="부목 길이 지정. 값 1개면 고정(예: 0.4), 2개면 범위(예: 0.33 0.45). 미지정 시 YAML 값 사용",
+)
+parser.add_argument(
     "--compare_all",
     action="store_true",
     help="Phase 2/3에서 Normal/FL/FR/RL/RR 다섯 조건을 고정 배치하여 한 화면에서 비교",
@@ -50,6 +58,9 @@ if args.compare_all:
     if args.phase not in (2, 3):
         parser.error("--compare_all은 --phase 2 또는 --phase 3와 함께 사용해야 합니다.")
     args.num_envs = 5
+
+if args.splint_length is not None and len(args.splint_length) not in (1, 2):
+    parser.error("--splint_length는 값 1개(고정) 또는 2개(범위)만 받습니다.")
 
 if args.video:
     args.enable_cameras = True
@@ -125,6 +136,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import go1_lab.tasks  # noqa: F401
+from go1_lab.splint import SPLINT_MAX, SPLINT_MIN
 
 from peg_leg_action_wrapper import PegLegActionMaskWrapper
 
@@ -223,6 +235,23 @@ def main(
         peg_event.params["healthy_slots"] = 1
         peg_event.params["prob_peg_leg"] = 0.8
 
+    # 부목 길이를 CLI에서 지정한 경우 YAML의 splint_length_range를 덮어쓴다.
+    # 값 1개면 (L, L) 고정, 2개면 균등분포 범위로 사용한다.
+    if args.splint_length is not None:
+        peg_event = env_cfg.events.randomize_peg_leg_actuation
+        if peg_event is None:
+            raise RuntimeError(
+                "--splint_length를 사용하려면 peg-leg reset event가 활성화되어야 합니다."
+            )
+        lo = min(args.splint_length)
+        hi = max(args.splint_length)
+        if lo < SPLINT_MIN or hi > SPLINT_MAX:
+            raise ValueError(
+                f"--splint_length {args.splint_length}는 USD 설계 한계 "
+                f"[{SPLINT_MIN}, {SPLINT_MAX}] 안에 있어야 합니다."
+            )
+        peg_event.params["splint_length_range"] = (lo, hi)
+
     # 평가는 지정한 조건(normal/FL/FR/RL/RR/balanced)을 그대로 유지해야 한다.
     # 학습용 peg-leg curriculum이 남아 있으면 환경 reset 직전에 계산되어
     # 위에서 설정한 평가용 prob_peg_leg를 curriculum 초기값으로 덮어쓸 수 있다.
@@ -305,6 +334,9 @@ def main(
     print(f"[INFO] Seed          : {seed}")
     print(f"[INFO] Environments  : {env_cfg.scene.num_envs}")
     print(f"[INFO] Peg-leg eval  : {eval_peg_leg}")
+    if args.splint_length is not None:
+        splint_range = env_cfg.events.randomize_peg_leg_actuation.params["splint_length_range"]
+        print(f"[INFO] Splint length : {splint_range[0]:.3f} ~ {splint_range[1]:.3f} m (CLI override)")
     if config.phase in {"phase1", "phase2", "phase3"}:
         print(
             "[INFO] Policy noise  : "

@@ -20,8 +20,11 @@ import os
 from .presence import LEGS, TINY_MASS, set_splint_presence  # noqa: F401
 from .usd_builder import (  # noqa: F401
     NOMINAL_LEG_REACH,
+    SPLINT_LATERAL,
     SPLINT_MAX,
     SPLINT_MIN,
+    SPLINT_PITCH,
+    SPLINT_TIP_RADIUS,
     build_splint_usd,
 )
 

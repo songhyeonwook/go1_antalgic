@@ -20,24 +20,10 @@ if TYPE_CHECKING:
 # RLS 부목 길이 추정 채널 (policy/student 관측)
 # =====================================================================
 # 부목 길이 L 은 실기에서 어떤 인코더에도 나타나지 않고, 착지 시의 기하 구속
-#   z_tip - z_stance_foot = c(q, g) + a(q, g)·L = 0
-# 을 통해서만 관측된다. 이 등식은 L 에 선형이고 미지수가 스칼라이므로 RLS
-# (스칼라 공분산 P)로 추정한다. 정책은 (L̂, √P) 를 명시적 입력으로 받는다.
+# 을 통해서만 관측된다. 추정기 본체(FK + 스칼라 RLS + 게이트)는 mdp/rls.py.
+# 이 항은 (L̂, √P) 버퍼를 정규화해 정책 입력으로 노출하기만 한다.
 
-RLS_L_PRIOR = 0.39   # L 샘플 범위 [0.33, 0.45] 의 중앙 = prior 평균 (m)
-RLS_L_SCALE = 0.06   # 정규화 스케일 = 샘플 범위 반폭 (m)
-RLS_P0 = RLS_L_SCALE ** 2  # prior 분산
-
-
-def _ensure_rls_buffers(env: "ManagerBasedRLEnv") -> None:
-    if not hasattr(env, "_rls_L_hat"):
-        env._rls_L_hat = torch.full(
-            (env.num_envs,), RLS_L_PRIOR, device=env.device, dtype=torch.float32
-        )
-    if not hasattr(env, "_rls_P"):
-        env._rls_P = torch.full(
-            (env.num_envs,), RLS_P0, device=env.device, dtype=torch.float32
-        )
+from .rls import RLS_L_PRIOR, RLS_L_SCALE, RLS_P0, ensure_rls_buffers  # noqa: E402
 
 
 @generic_io_descriptor(
@@ -50,9 +36,9 @@ def rls_estimate(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """RLS 부목 길이 추정 [L̂_norm, √P_norm] (2차원).
 
     L̂_norm = (L̂ - prior) / scale,  √P_norm = √P / √P0 (prior 에서 1.0,
-    추정이 확실해질수록 0 으로 감소). RLS 모듈이 붙기 전까지는 [0, 1] 상수.
+    추정이 확실해질수록 0 으로 감소). rls_params 미설정 시 prior 상수.
     """
-    _ensure_rls_buffers(env)
+    ensure_rls_buffers(env)
     l_norm = (env._rls_L_hat - RLS_L_PRIOR) / RLS_L_SCALE
     p_norm = torch.sqrt(torch.clamp(env._rls_P, min=0.0)) / math.sqrt(RLS_P0)
     return torch.stack([l_norm, p_norm], dim=-1)

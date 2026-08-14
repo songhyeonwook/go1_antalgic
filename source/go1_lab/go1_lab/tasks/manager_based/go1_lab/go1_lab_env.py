@@ -12,6 +12,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 from .go1_lab_env_cfg import Go1LabEnvCfg
+from .mdp.rls import update_rls
 
 
 class Go1LabEnv(ManagerBasedRLEnv):
@@ -94,6 +95,13 @@ class Go1LabEnv(ManagerBasedRLEnv):
         self.command_manager.compute(dt=self.step_dt)
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
+
+        # RLS 부목 길이 추정 갱신 (착지 등식 + 토크 게이트).
+        # 리셋 직후 env 는 reset 이벤트가 prior 로 되돌려 두었고
+        # episode_length_buf==0 가드로 이번 스텝 갱신에서 제외된다.
+        if self.cfg.rls_params is not None:
+            update_rls(self, self.cfg.rls_params)
+
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras

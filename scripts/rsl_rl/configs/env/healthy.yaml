@@ -97,11 +97,24 @@ observation:
   # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (Phase 2/3와 차원 일치용)
   use_rls_estimate: true
 
+  # live RLS 파라미터 (healthy 는 부상 env 가 없어 항상 prior 에 머무름 —
+  # antalgic.yaml 과 동일 구조 유지용)
+  rls:
+    torque_gate_nm: 3.2
+    foot_stance_n: 20.0
+    update_stride: 3
+    meas_noise_std: 0.005
+    innovation_gate_m: 0.08
+    min_axis_coef: 0.3
+
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
   # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
   privileged:
     enabled: true
+    # antalgic.yaml 과 동일 구조 유지 (healthy 는 부상 env 가 없어 μ term 이
+    # 상수 — 노이즈만 얹힘)
+    mu_noise_std: 0.15
 
 # Domain Randomization OK
 domain_randomization:
@@ -133,6 +146,8 @@ domain_randomization:
     base_ang_vel_std: 0.05
     projected_gravity_std: 0.05
     base_lin_vel_std: 0.05
+    # antalgic.yaml 과 동일 — healthy 는 항상 prior 라 사실상 상수에 노이즈
+    rls_estimate_std: 0.05
 
 # 전방 Payload 및 CoM 설정 OK
 payload:

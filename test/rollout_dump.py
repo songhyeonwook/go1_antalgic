@@ -161,6 +161,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     splint_b = [body_names.index(f"{leg}_splint") for leg in LEGS]
     foot_b = [body_names.index(f"{leg}_foot") for leg in LEGS]
     calf_b = [body_names.index(f"{leg}_calf") for leg in LEGS]
+    # GT body 위치 (FK 구현 검증 전용 — 추정기 입력으로는 사용 금지)
+    robot_bodies = list(robot.body_names)
+    rb_foot = [robot_bodies.index(f"{leg}_foot") for leg in LEGS]
+    rb_splint = [robot_bodies.index(f"{leg}_splint") for leg in LEGS]
+    rb_thigh = [robot_bodies.index(f"{leg}_thigh") for leg in LEGS]
 
     N, T = args.num_envs, args.steps
     rec: dict[str, list] = {k: [] for k in (
@@ -169,6 +174,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "root_state", "projected_gravity", "commands",
         "contact_splint", "contact_foot", "contact_calf",
         "gt_leg", "gt_L", "gt_mu", "lock_active", "dones",
+        "pos_feet_w", "pos_splint_w", "pos_thigh_w",
     )}
 
     def grab(t: torch.Tensor) -> np.ndarray:
@@ -202,6 +208,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             rec["contact_splint"].append(grab(f[:, splint_b]))
             rec["contact_foot"].append(grab(f[:, foot_b]))
             rec["contact_calf"].append(grab(f[:, calf_b]))
+            rec["pos_feet_w"].append(grab(robot.data.body_pos_w[:, rb_foot]))
+            rec["pos_splint_w"].append(grab(robot.data.body_pos_w[:, rb_splint]))
+            rec["pos_thigh_w"].append(grab(robot.data.body_pos_w[:, rb_thigh]))
             rec["gt_leg"].append(base._peg_leg_index.detach().cpu().numpy().astype(np.int8))
             rec["gt_L"].append(grab(base._peg_leg_splint_length))
             rec["gt_mu"].append(grab(base._peg_leg_foot_friction))
@@ -243,7 +252,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
 
 
 if __name__ == "__main__":
+    # simulation_app.close() 는 종료 시 세그폴트로 원래 예외를 삼킬 수 있어
+    # (실측) 다른 test 스크립트처럼 traceback 출력 후 os._exit 로 끝낸다.
+    import os
+    import traceback
+
     try:
         main()
-    finally:
-        simulation_app.close()
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    sys.stdout.flush()
+    os._exit(0)

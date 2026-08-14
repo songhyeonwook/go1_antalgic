@@ -680,10 +680,12 @@ def penalty_pain(
     max_penalty: float = 200.0,
     base_contact_cost: float = 0.0,
     contact_detect_threshold: float = 1.0,
-    
+
     base_contact_cost_severe_multiplier: float = 1.0,
     base_contact_cost_mild_multiplier: float = 1.0,
     include_calf: bool = True,
+    include_splint: bool = False,
+    splint_attenuation: float = 0.5,
     severity_scaled: bool = False,
     severe_splint_length: float = 0.20,
     mild_splint_length: float = 0.30,
@@ -692,7 +694,23 @@ def penalty_pain(
     scale_severe_multiplier: float = 1.25,
     scale_mild_multiplier: float = 0.85,
 ) -> torch.Tensor:
+    """부상 다리 통각(nociceptor) 페널티.
 
+    통증원 3경로:
+      발 / calf 접촉      — 부상지 직접 접촉 (전달률 1.0, 최악)
+      부목 끝단 접촉 하중  — include_splint=True 일 때. 보조기를 거친 하중도
+        커프 압박·축하중으로 통증을 유발하되 감쇠됨(splint_attenuation).
+        이 항이 없으면 v2 부목 모델에서는 발이 기구적으로 들려 있어 pain 이
+        무의미해지고, 하중 상한이 통각이 아니라 역학으로 결정된다 — antalgic
+        하중 재분배 메커니즘의 핵심이므로 부상 모델에서는 켜야 한다.
+
+    유효 통증 하중:
+      F_pain = F_foot [+ F_calf] [+ splint_attenuation · F_splint]
+      C_pain(F) = P_base·1[contact] + min(expm1(clip(α(F − F_th))), max)
+
+    nonuse 하한(injured_limb_*)과 이 상한 사이 밴드에서 부목 하중 평형이
+    형성된다 — 하한 < F_th/attenuation 이어야 두 항이 충돌하지 않는다.
+    """
     _ = asset_cfg
     contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=True)
     if include_calf:
@@ -705,6 +723,12 @@ def penalty_pain(
         )
     else:
         contact_by_calf = torch.zeros_like(contact_by_foot)
+    if include_splint:
+        contact_by_splint = _splint_force_tensor(
+            env, sensor_name=sensor_name, use_z_only=True
+        )
+    else:
+        contact_by_splint = torch.zeros_like(contact_by_foot)
 
     peg_leg_idx = _peg_leg_index_per_env(env)
 
@@ -713,6 +737,7 @@ def penalty_pain(
     scale = float(pain_scale)
     base_cost = float(base_contact_cost)
     detect_th = float(contact_detect_threshold)
+    atten = float(splint_attenuation)
 
     for leg in range(4):
         mask = peg_leg_idx == leg
@@ -720,15 +745,15 @@ def penalty_pain(
         if not mask.any():
             continue
 
-        leg_force = (
-            contact_by_foot[mask, leg]
-            + contact_by_calf[mask, leg]
-        )
+        # 직접 접촉(발/calf)과 보조기 경유(부목) 하중을 분리해 집계
+        direct_force = contact_by_foot[mask, leg] + contact_by_calf[mask, leg]
+        leg_force = direct_force + atten * contact_by_splint[mask, leg]
 
         if base_cost > 0.0:
-            is_contact = (
-                leg_force > detect_th
-            ).float()
+            # 기저 접촉 비용은 '부상 조직의 직접 접촉'에만 — 부목 스탠스에
+            # 매 스텝 과금하면 duty 하한(nonuse)과 반대 방향으로 작용한다.
+            # 부목 하중의 통증은 임계 초과분(아래 exp 항)만 담당.
+            is_contact = (direct_force > detect_th).float()
 
             penalty[mask] += base_cost * is_contact
 

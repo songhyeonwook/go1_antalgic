@@ -95,6 +95,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
     use_peg_leg: bool = None
     use_peg_leg_action_mask: bool = None
     grace_steps: int = None
+    # RLS live 갱신 파라미터 (None 이면 rls_estimate 채널이 prior 상수로 유지)
+    rls_params: dict = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -307,6 +309,20 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
         # [FL, FR, RL, RR, injured_flag, L, friction, lin_vel(3)]
 
+        # μ(부목 끝단 마찰) 정보 열화: teacher 는 feedforward 라 시간 평균으로
+        # 노이즈를 상쇄할 수 없으므로, per-step iid 노이즈 std ≈ student 의
+        # μ̂ 도달 정확도(±0.14, 미끄럼 특징 누적 회귀 상한)로 두면 distillation
+        # 타깃이 student 가 따라갈 수 있는 정보 수준이 된다.
+        # 다른 privileged term 은 noise cfg 가 없어 corruption 을 켜도 깨끗하다.
+        mu_noise_std = float(privileged_cfg.get("mu_noise_std", 0.0))
+        if mu_noise_std > 0.0:
+            from isaaclab.utils.noise import GaussianNoiseCfg
+
+            self.observations.privileged_obs.enable_corruption = True
+            self.observations.privileged_obs.peg_leg_foot_friction.noise = (
+                GaussianNoiseCfg(mean=0.0, std=mu_noise_std)
+            )
+
         # 부상 전 nominal 기준의 calf 관절각 4차원 추가
         if bool(cfg["use_calf_pos_nominal_rel"]):
             self.observations.policy.calf_pos_abs = ObsTerm(
@@ -316,12 +332,22 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             self.observations.policy.calf_pos_abs = None
 
         # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (2차원).
-        # 지금은 prior 상수를 반환하는 자리표시자 — 추정기 모듈이 붙기 전에
-        # 관측 차원을 미리 고정해 두어 phase 간/추후 체크포인트 호환을 지킨다.
+        # rls 블록이 있으면 live 갱신 (mdp/rls.py — 착지 등식 + 토크 게이트),
+        # 없으면 prior 상수 (차원 예약만). healthy phase 는 부상 env 가 없어
+        # live 여도 prior 에 머무르므로 두 경우가 동일하다.
         if bool(cfg["use_rls_estimate"]):
             self.observations.policy.rls_estimate = ObsTerm(
                 func=mdp.rls_estimate
             )
+            if "rls" in cfg:
+                self.rls_params = {
+                    "torque_gate_nm": float(cfg["rls"]["torque_gate_nm"]),
+                    "foot_stance_n": float(cfg["rls"]["foot_stance_n"]),
+                    "update_stride": int(cfg["rls"]["update_stride"]),
+                    "meas_noise_std": float(cfg["rls"]["meas_noise_std"]),
+                    "innovation_gate_m": float(cfg["rls"]["innovation_gate_m"]),
+                    "min_axis_coef": float(cfg["rls"]["min_axis_coef"]),
+                }
         
     def _apply_domain_randomization_settings(self, cfg) -> None:
         
@@ -399,6 +425,9 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 "base_ang_vel": "base_ang_vel_std",
                 "projected_gravity": "projected_gravity_std",
                 "base_lin_vel": "base_lin_vel_std",
+                # live RLS 채널은 sim 에서 오라클급이므로 실기 추정 오차만큼
+                # 노이즈를 얹는다 (yaml 키가 없으면 노이즈 없이 유지)
+                "rls_estimate": "rls_estimate_std",
             }
 
             for term_name, yaml_key in noise_mapping.items():
@@ -408,7 +437,7 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     None,
                 )
 
-                if term is not None:
+                if term is not None and yaml_key in noise_cfg:
                     term.noise = GaussianNoiseCfg(
                         mean=0.0,
                         std=float(noise_cfg[yaml_key]),
@@ -522,6 +551,9 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     "base_contact_cost": float(pain_cfg["base_contact_cost"]),
                     "contact_detect_threshold": float(pain_cfg["contact_detect_threshold"]),
                     "include_calf": bool(pain_cfg["include_calf"]),
+                    # 부목을 거친 하중도 (감쇠된) 통증원 — antalgic 상한 형성
+                    "include_splint": bool(pain_cfg["include_splint"]),
+                    "splint_attenuation": float(pain_cfg["splint_attenuation"]),
                 },
             )
         else:

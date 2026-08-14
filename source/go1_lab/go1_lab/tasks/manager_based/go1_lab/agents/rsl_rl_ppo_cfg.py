@@ -15,6 +15,8 @@ from isaaclab_rl.rsl_rl import (
 )
 
 from go1_lab.tasks.manager_based.go1_lab.mdp import symmetric_ppo  # noqa: F401  registers SymmetricPPO
+from go1_lab.tasks.manager_based.go1_lab.mdp import aux_distillation  # noqa: F401  registers StudentTeacherRecurrentAux / DistillationAux
+from go1_lab.tasks.manager_based.go1_lab.mdp.rls import RLS_L_PRIOR, RLS_L_SCALE
 
 
 @configclass
@@ -95,6 +97,35 @@ class Phase2InjuryRunnerCfg(BaseRunnerCfg):
 # =====================================================================
 
 @configclass
+class StudentTeacherRecurrentAuxCfg(RslRlDistillationStudentTeacherRecurrentCfg):
+    """StudentTeacherRecurrent + latent 보조 예측 헤드 [L̂, μ̂]."""
+
+    class_name: str = "StudentTeacherRecurrentAux"
+    aux_num_targets: int = 2
+
+
+@configclass
+class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
+    """Distillation + 보조 지도 손실 (부상 env 마스킹).
+
+    aux_targets 의 shift/scale 은 관측 정규화와 동일 규약:
+      L: (L − RLS_L_PRIOR) / RLS_L_SCALE  (rls_estimate 채널과 일치)
+      μ: (μ − 1.0) / 0.5                  (foot_friction_range [0.5, 1.5])
+    """
+
+    class_name: str = "DistillationAux"
+    aux_loss_coef: float = 0.5
+    # privileged_obs = [FL, FR, RL, RR, injured_flag, L, μ, lin_vel(3)]
+    aux_mask: dict = {"group": "privileged_obs", "index": 4}
+    aux_targets: list = [
+        {"name": "splint_length", "group": "privileged_obs", "index": 5,
+         "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
+        {"name": "foot_friction", "group": "privileged_obs", "index": 6,
+         "shift": 1.0, "scale": 0.5},
+    ]
+
+
+@configclass
 class DistillRunnerCfg(RslRlDistillationRunnerCfg):
     """Phase 3: Student distillation.
 
@@ -105,13 +136,6 @@ class DistillRunnerCfg(RslRlDistillationRunnerCfg):
     """
 
     num_steps_per_env = 32
-    # Phase 2 teacher 가 15000 iter 로 학습되었을 때, student 가 교사의 latent 를
-    # 5가지 시나리오(정상 + FL/FR/RL/RR 부상) 전체에 걸쳐 모사하기 위해 권장 12000 iter.
-    # 근거:
-    #   - sample-equivalent: Phase 2(15k × 24 × 4096) = 1.47B → Phase 3 에서 동일 경험 확보에
-    #     약 11250 iter (32 × 4096) 필요. 12000 은 그에 소폭 여유 추가.
-    #   - 다중 시나리오 LSTM distillation 은 60-80% of teacher time 이 경험적 sweet spot.
-    #   - Loss plateau 에 도달하면 save_interval 로 저장된 중간 체크포인트에서 조기 중단 가능.
     max_iterations = 12000
     save_interval = 100
     experiment_name = "unitree_go1_rough_student"
@@ -130,7 +154,7 @@ class DistillRunnerCfg(RslRlDistillationRunnerCfg):
     
     """
 
-    policy = RslRlDistillationStudentTeacherRecurrentCfg(
+    policy = StudentTeacherRecurrentAuxCfg(
         init_noise_std=0.05,
         noise_std_type="log",
         student_obs_normalization=False,
@@ -141,20 +165,12 @@ class DistillRunnerCfg(RslRlDistillationRunnerCfg):
         rnn_type="lstm",
         rnn_hidden_dim=256,
         rnn_num_layers=1,
-        # The Phase-2 teacher is a FEEDFORWARD MLP (TeacherMlp pivot), so the
-        # distillation must load it as non-recurrent (recurrence lives only in the
-        # student LSTM). teacher_recurrent=True would expect an RNN the MLP teacher
-        # checkpoint does not have.
         teacher_recurrent=False,
     )
 
-    algorithm = RslRlDistillationAlgorithmCfg(
+    algorithm = DistillationAuxCfg(
         num_learning_epochs=5,
-        # 1e-3는 LSTM distillation에서 불안정/편향(한쪽 다리만 잘 배우는 현상)을
-        # 유발할 수 있음. 5e-4로 낮춰 수렴을 안정화.
         learning_rate=5.0e-4,
-        # BPTT 윈도우: 20→32로 늘려 보행 주기(약 20~30 step) + 부상 적응 long-horizon 패턴을
-        # Student가 모사할 수 있도록 함. num_steps_per_env=32와 정렬.
         gradient_length=32,
         max_grad_norm=1.0,
         optimizer="adam",

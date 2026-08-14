@@ -9,11 +9,11 @@ train:
 
 checkpoint:
   mode: "distill" # warmstart, resume
-  #파일을 교체하거나, pc가 바뀌어서 경로가 달라졌을 때, 경로 확인 및 변경
-  teacher: /home/unicon/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_08_12_30_08_phase2_s42_P2-001/model_13998.pt
+  # Phase 2 teacher (부목 모델 v2)
+  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_13_20_39_04_phase2_s42_P2-splint-003-liverls/model_10998.pt
   student: ""
   load_optimizer: false # false, true
-  reset_iteration: true 
+  reset_iteration: true
   
 env:
   path: ../env/antalgic.yaml

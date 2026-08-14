@@ -14,6 +14,8 @@ from isaaclab.managers import SceneEntityCfg
 
 from go1_lab.splint import LEGS, SPLINT_MAX, SPLINT_MIN, set_splint_presence
 
+from .rls import reset_rls
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -575,6 +577,9 @@ def randomize_peg_leg_actuation(
             getattr(env, "_splint_attach", attach),
             env_ids=env_ids_t[changed],
         )
+
+    # ━━━ RLS 추정 상태 리셋 (에피소드마다 L 재추첨 → prior 복귀) ━━━
+    reset_rls(env, env_ids_t)
 
     # ━━━ 버퍼 저장 ━━━
     fold = float(fold_knee_angle)

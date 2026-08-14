@@ -25,8 +25,6 @@ peg_leg:
   injured_splint_friction_only: true
 
   # curriculum이 꺼져있는 경우 아래 범위로 사용.
-  # ⚠️ 부목 모델 v2: L 은 골반 부착점→끝단 길이. nominal leg reach ≈ 0.31 m 이므로
-  #    0.33 미만은 접지 불가, USD 설계 상한(SPLINT_MAX)은 0.48.
   splint_length_range: [0.33, 0.45] # 부목 길이 균등분포 파라미터
   foot_friction_range: [0.5, 1.5] # 부목 끝단에 사용할 마찰계수 샘플 범위
 
@@ -114,14 +112,25 @@ observation:
   use_calf_pos_nominal_rel: true
 
   # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] 을 policy 관측에 추가
-  # (추정기 모듈이 붙기 전까지는 prior 상수 — 차원 예약용)
   use_rls_estimate: true
+
+  # live RLS 갱신 파라미터 (mdp/rls.py — 착지 등식 + 토크 게이트).
+  rls:
+    torque_gate_nm: 3.2      # 부목 접지 판정 √(τ_hip²+τ_thigh²) [N·m]
+    foot_stance_n: 20.0      # 기준 발 스탠스 판정 접촉력 [N]
+    update_stride: 3         # episode step 서브샘플 주기 (상관 노이즈 완화)
+    meas_noise_std: 0.005    # 측정 노이즈 표준편차 [m]
+    innovation_gate_m: 0.08  # innovation 기각 임계 [m]
+    min_axis_coef: 0.3       # ĝ·b 최소값 (부목 축이 수평이면 정보 없음)
 
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
   # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
   privileged:
     enabled: true
+    # teacher 의 μ(부목 마찰) 정보를 student 가 도달 가능한 추정 정확도
+    # (±0.14, 미끄럼 특징 누적 회귀 상한)로 열화. 0 이면 GT 그대로.
+    mu_noise_std: 0.15
 
 # Domain Randomization OK
 domain_randomization:
@@ -153,6 +162,9 @@ domain_randomization:
     base_ang_vel_std: 0.05
     projected_gravity_std: 0.05
     base_lin_vel_std: 0.05
+    # sim RLS 는 GT 신호 기반 오라클 — 실기(인코더/IMU 노이즈, 경사)의
+    # 추정 오차를 흉내내 L̂ 과의존을 막는다. 0.05 ≈ L 기준 3 mm
+    rls_estimate_std: 0.05
 
 # 전방 Payload 및 CoM 설정 OK
 payload:
@@ -256,7 +268,11 @@ reward:
       weight: -0.02
 
       # 통증 함수
-      failure_force_threshold: 16.0 # 통증이 시작되는 기준
+      # 캘리브레이션 (P2-001 정상보행 실측 Fz: 스탠스 평균 52.3 N 기준):
+      #   유효 임계 8 N ÷ splint_attenuation 0.5 = 부목힘 16 N = 정상의 31%
+      #   → 구모델(발 접촉 16 N = 31%)의 검증된 통각 시작점을 부목 경로에 복원.
+      #   평형 밴드: nonuse 하한 10 N (19%) < 부목 하중 < 통증 시작 16 N (31%)
+      failure_force_threshold: 8.0 # 통증이 시작되는 유효 하중 기준 [N]
       pain_scale: 0.4 # 통증이 얼마나 빠르게 증가하는지 결정하는 계수
       max_exp_argument: 10.0 # pain form의 x상한
       max_penalty: 200.0 # pain form y상한
@@ -267,6 +283,9 @@ reward:
 
       # calf 접촉력까지 포함
       include_calf: true
+      # 부목을 거친 하중도 (감쇠된) 통증원 — antalgic 상한 형성
+      include_splint: true
+      splint_attenuation: 0.5
 
     # 부목 다리를 쓰지 않으면 주는 벌점: 부상 다리를 완전히 들고 걷는 3족 보행 억제
     # (부목 모델 v2: 하중은 부목 끝단 접촉력으로 측정)
