@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -196,9 +197,14 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
     environment_cfg = EnvironmentConfig(path=env_path, values=environment_values)
 
     exploration_cfg = parse_exploration_config(phase_cfg)
-        
+
+    # 변형 phase 파일(예: phase2_ft.yaml — ablation)도 base phase 로 정규화한다.
+    # train.py 의 runner 선택/exploration 분기가 phase1/2/3 문자열에 의존하기 때문.
+    phase_match = re.match(r"(phase\d+)", phase_path.stem)
+    phase_name = phase_match.group(1) if phase_match else phase_path.stem
+
     return ExperimentConfig(
-        phase=phase_path.stem,
+        phase=phase_name,
         train=train_cfg,
         environment=environment_cfg,
         checkpoint=checkpoint_cfg,

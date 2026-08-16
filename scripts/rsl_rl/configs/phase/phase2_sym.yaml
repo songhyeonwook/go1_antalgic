@@ -1,0 +1,49 @@
+# Symmetry-encouraging 대조군 (3-paradigm 비교의 세 번째 축).
+
+#
+#   PYTHONPATH=/home/shw/go1_lod/source/go1_lab python3 train.py --phase 2 \
+#       --phase_config_path configs/phase/phase2_sym.yaml \
+#       --run_tag P2-symmetric-001 --headless
+
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase2_cfg_entry_point
+
+  num_envs: 2048
+  max_iterations: 6000
+  seed: 42
+
+checkpoint:
+  mode: "warmstart"
+  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_12_23_51_57_phase1_s42_P1-splint-001/model_4999.pt
+  student: ""
+  load_optimizer: false
+  reset_iteration: false
+
+env:
+  path: ../env/antalgic.yaml
+  overrides:
+    name: joint_symmetric
+    reward:
+      injury:
+        enabled: false          # pain + injured_limb_*_nonuse 비활성
+      joint_mirror_symmetry:
+        enabled: true           # ||q − M(q)||² 페널티
+        weight: -2.0
+
+eval:
+  peg_leg: normal
+
+exploration:
+  noise_std:
+    set: log
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true
+      log:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+        enforce_min_std: true

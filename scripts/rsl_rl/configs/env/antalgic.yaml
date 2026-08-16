@@ -125,11 +125,9 @@ observation:
 
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
-  # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
   privileged:
     enabled: true
     # teacher 의 μ(부목 마찰) 정보를 student 가 도달 가능한 추정 정확도
-    # (±0.14, 미끄럼 특징 누적 회귀 상한)로 열화. 0 이면 GT 그대로.
     mu_noise_std: 0.15
 
 # Domain Randomization OK
@@ -162,8 +160,6 @@ domain_randomization:
     base_ang_vel_std: 0.05
     projected_gravity_std: 0.05
     base_lin_vel_std: 0.05
-    # sim RLS 는 GT 신호 기반 오라클 — 실기(인코더/IMU 노이즈, 경사)의
-    # 추정 오차를 흉내내 L̂ 과의존을 막는다. 0.05 ≈ L 기준 3 mm
     rls_estimate_std: 0.05
 
 # 전방 Payload 및 CoM 설정 OK
@@ -264,18 +260,12 @@ reward:
     enabled: true 
     
     penalty_pain:             # 부상 다리에 접촉력·과부하가 생길 때 통증 페널티
-      enabled: True
+      enabled: true 
       weight: -0.02
-
-      # 통증 함수
-      # 캘리브레이션 (P2-001 정상보행 실측 Fz: 스탠스 평균 52.3 N 기준):
-      #   유효 임계 8 N ÷ splint_attenuation 0.5 = 부목힘 16 N = 정상의 31%
-      #   → 구모델(발 접촉 16 N = 31%)의 검증된 통각 시작점을 부목 경로에 복원.
-      #   평형 밴드: nonuse 하한 10 N (19%) < 부목 하중 < 통증 시작 16 N (31%)
       failure_force_threshold: 8.0 # 통증이 시작되는 유효 하중 기준 [N]
-      pain_scale: 0.4 # 통증이 얼마나 빠르게 증가하는지 결정하는 계수
-      max_exp_argument: 10.0 # pain form의 x상한
-      max_penalty: 200.0 # pain form y상한
+      pain_scale: 0.15 # 통증이 얼마나 빠르게 증가하는지 결정하는 계수
+      max_exp_argument: 12.0 # pain form의 x상한
+      max_penalty: 1000.0 # pain form y상한
       
       # 접촉 자체에 대한 기본 비용
       base_contact_cost: 0.05 #접촉에 대한 기본 비용
@@ -288,13 +278,11 @@ reward:
       splint_attenuation: 0.5
 
     # 부목 다리를 쓰지 않으면 주는 벌점: 부상 다리를 완전히 들고 걷는 3족 보행 억제
-    # (부목 모델 v2: 하중은 부목 끝단 접촉력으로 측정)
     injured_limb_force_nonuse:
       enabled: true
       weight: -1.0
 
       # true 면 발+calf 접촉력도 하중에 합산 (구모델 호환).
-      # v2 에서 발/calf 접촉은 통증(penalty_pain) 대상이므로 false 권장.
       include_calf: false
 
       min_force_severe: 5.0
@@ -312,10 +300,8 @@ reward:
       ramp_duration_steps: 40000
 
     injured_limb_load_duty_nonuse:  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
-      enabled: true
+      enabled: false #->survial_bonus용 기존 true
       weight: -1.5
-      # 부목 끝단 힘 > 10 N인 유효 하중 시간이 목표 duty 미만이면 벌점
-      # (severe/mild 기준 길이는 peg_leg.splint_length_range 에서 자동 유도)
       load_contact_threshold: 10.0
       min_duty_severe: 0.28
       min_duty_mild: 0.4

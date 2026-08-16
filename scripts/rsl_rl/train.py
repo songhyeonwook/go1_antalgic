@@ -79,6 +79,10 @@ parser.add_argument("--phase", type=int, choices=[1, 2, 3], required=True, help=
 parser.add_argument("--common_config_path", type=str, required=False, default=f"{current_file}/configs/common.yaml", help="Path to YAML log config")
 parser.add_argument("--log_config_path", type=str, required=False, default=f"{current_file}/configs/logger.yaml" ,help="Path to YAML log config") 
 parser.add_argument("--run_tag", type=str, default="", help="실험 구분 이름. 예: z1_air050")
+parser.add_argument(
+    "--phase_config_path", type=str, default=None,
+    help="phase YAML 경로 직접 지정 (ablation 용. 예: configs/phase/phase2_ft.yaml). 미지정 시 configs/phase/phase{N}.yaml",
+)
 AppLauncher.add_app_launcher_args(parser)
 
 # argparse가 아는 인자와 Hydra 인자를 분리
@@ -93,7 +97,9 @@ sys.argv = [
 ]
 
 phase_config_path = (
-    current_file / "configs" / "phase" / f"phase{args.phase}.yaml"
+    Path(args.phase_config_path).expanduser().resolve()
+    if args.phase_config_path
+    else current_file / "configs" / "phase" / f"phase{args.phase}.yaml"
 )
 
 

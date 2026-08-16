@@ -999,7 +999,26 @@ def penalize_joint_mirror_asymmetry(
     ]
     q = asset.data.joint_pos[:, leg_ids]
     qm = mirror_joint_tensor(q)
-    return torch.sum((q - qm) ** 2, dim=-1)
+    diff2 = (q - qm) ** 2                                # (N, 12) per-TYPE 순서
+
+    # 잠긴 calf 는 action 이 마스킹된 비제어 관절이다. 페널티에 남기면
+    # 건강한 미러 무릎을 접는 것만이 페널티를 줄이는 길이 되어(실측:
+    # 앞다리 부상 시 양 앞무릎이 접혀 몸통 앞쪽 붕괴, 높이 0.40→0.16 m)
+    # baseline 이 불공정해진다. 부상 env 에서는 잠긴 calf 와 그 미러 짝
+    # (calf 블록 = 인덱스 8..11, FL↔FR / RL↔RR)의 기여를 제외한다.
+    # 부상 다리의 hip/thigh 는 여전히 제어 가능하므로 대칭 대상으로 유지.
+    peg_leg_idx = _peg_leg_index_per_env(env)            # (N,) -1=정상
+    injured = peg_leg_idx >= 0
+    if bool(injured.any()):
+        mirror_of = torch.tensor([1, 0, 3, 2], device=env.device)
+        k = peg_leg_idx.clamp(min=0)
+        rows = torch.arange(env.num_envs, device=env.device)
+        mask = torch.ones_like(diff2)
+        mask[rows[injured], (8 + k)[injured]] = 0.0
+        mask[rows[injured], (8 + mirror_of[k])[injured]] = 0.0
+        diff2 = diff2 * mask
+
+    return torch.sum(diff2, dim=-1)
 
 
 # 발을 끄는 것에 대한 패널티가 아님. 접촉하는 것에 대한 패널티

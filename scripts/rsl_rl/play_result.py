@@ -4,489 +4,350 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Play a checkpoint and compute/plot duty factor and contact forces per leg.
 
-Duty factor = (time in contact) / (total time), computed from ContactSensor net forces.
-Contact Force = Average magnitude of force when in contact (or overall average).
-
-Outputs are saved next to the loaded checkpoint (same directory as play.py uses).
-"""
-
-"""Launch Isaac Sim Simulator first."""
+from __future__ import annotations
 
 import argparse
 import sys
-import os
-from datetime import datetime
 from pathlib import Path
-
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
 
 from isaaclab.app import AppLauncher
 
-# local imports
-import cli_args  # isort: skip
-from peg_leg_action_wrapper import PegLegActionMaskWrapper  # isort: skip
+from utils.config_builder import load_experiment_config
 
-# add argparse arguments (keep style close to play.py)
-parser = argparse.ArgumentParser(description="Play an RL agent and plot duty factor per leg (RSL-RL).")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O ops.")
-parser.add_argument("--num_envs", type=int, default=10, help="Number of environments to simulate (default: 10).")
-parser.add_argument(
-    "--task",
-    type=str,
-    default="Template-Go1-Lab-v0",
-    help="Task for loading agent/checkpoint (default: Template-Go1-Lab-v0).",
-)
-parser.add_argument(
-    "--play_env",
-    type=str,
-    default=None,
-    help="Environment to play in (e.g. Isaac-Velocity-Flat-Unitree-Go1-v0). If set, only the simulation env changes; result output (duty factor, contact force, groups, plots) is unchanged.",
-)
-parser.add_argument(
-    "--flat",
-    action="store_true",
-    default=False,
-    help="Use flat terrain for play (equivalent to --play_env Isaac-Velocity-Flat-Unitree-Go1-v0). Result format unchanged.",
-)
-parser.add_argument(
-    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
-)
-parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--use_pretrained_checkpoint", action="store_true", help="Use the pre-trained checkpoint.")
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint.") # Removed duplicate
+SCRIPT_DIR = Path(__file__).resolve().parent
+LEG_NAMES = ["FL", "FR", "RL", "RR"]
+GROUP_LABELS = ["Normal", "FL Peg", "FR Peg", "RL Peg", "RR Peg"]
+# rls_estimate / aux head 정규화 규약 (mdp/rls.py, DistillationAuxCfg 와 동일)
+L_PRIOR, L_SCALE = 0.39, 0.06
+MU_PRIOR, MU_SCALE = 1.0, 0.5
 
-# duty-factor specific args
-parser.add_argument("--steps", type=int, default=1000, help="Number of steps to run for duty factor estimation.")
-parser.add_argument(
-    "--contact_sensor",
-    type=str,
-    default="contact_forces",
-    help="Scene name for ContactSensor (default: contact_forces).",
-)
-parser.add_argument(
-    "--contact_threshold",
-    type=float,
-    default=1.0,
-    help="Contact threshold in N for detecting contact (default: 1.0).",
-)
-parser.add_argument(
-    "--use_z_only",
-    action="store_true",
-    default=False,
-    help="Use |Fz| only as GRF proxy instead of ||F||.",
-)
-parser.add_argument(
-    "--no_show",
-    action="store_true",
-    default=False,
-    help="Do not open plot window (always saves png).",
-)
-
-# append RSL-RL cli arguments
-cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
+parser = argparse.ArgumentParser(description="보행 지표 + 부목 추정 결과 추출 (RSL-RL)")
+parser.add_argument("--phase", type=int, choices=(1, 2, 3), default=3)
+parser.add_argument("--checkpoint", type=str, required=True, help="재생할 model_*.pt 경로")
+parser.add_argument("--num_envs", type=int, default=40, help="5의 배수 권장 (조건 균등 배정)")
+parser.add_argument("--steps", type=int, default=1500, help="수집 스텝 (50 Hz — 1500 = 30 s)")
+parser.add_argument("--seed", type=int, default=None)
+parser.add_argument("--contact_threshold", type=float, default=5.0, help="접지 판정 힘 [N]")
+parser.add_argument("--use_z_only", action="store_true", help="||F|| 대신 |Fz| 사용")
+parser.add_argument("--no_show", action="store_true", help="plot 창을 띄우지 않음 (png 는 항상 저장)")
 AppLauncher.add_app_launcher_args(parser)
+args, hydra_args = parser.parse_known_args()
 
-# parse the arguments
-args_cli, hydra_args = parser.parse_known_args()
+config = load_experiment_config(
+    phase_path=SCRIPT_DIR / "configs" / "phase" / f"phase{args.phase}.yaml",
+    common_path=str(SCRIPT_DIR / "configs" / "common.yaml"),
+)
 
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
+sys.argv = [sys.argv[0], *hydra_args,
+            "hydra/job_logging=disabled", "hydra.output_subdir=null", "hydra.run.dir=."]
 
-# clear sys.argv for hydra
-sys.argv = [sys.argv[0]] + hydra_args
-
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
+app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+# ── Isaac Sim 시작 이후 import ──────────────────────────────────────────
+import gymnasium as gym  # noqa: E402
+import matplotlib  # noqa: E402
 
-import gymnasium as gym
-from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
-from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
-from isaaclab_rl.rsl_rl import (
-    RslRlBaseRunnerCfg,
-    RslRlVecEnvWrapper,
-    export_policy_as_jit,
-    export_policy_as_onnx,
-)
-from isaaclab_tasks.utils.hydra import hydra_task_config
+matplotlib.use("Agg")  # 저장 우선 — --no_show 아니면 마지막에 show
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
-# Import extensions to set up environment (incl. Isaac Lab built-in tasks for --play_env)
-import isaaclab_tasks  # noqa: F401
-import go1_lab.tasks  # noqa: F401
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner  # noqa: E402
+from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: E402
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper  # noqa: E402
+import isaaclab_tasks  # noqa: F401, E402
+from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
+import go1_lab.tasks  # noqa: F401, E402
 
-# Import peg leg helper
-from go1_lab.tasks.manager_based.go1_lab.mdp.events import _get_peg_leg_per_env
 
-def calculate_duty_factor(contact_history, threshold=1.0):
-    """
-    contact_history: (steps, num_legs) tensor or array
-    Returns: (num_legs,) array of duty factors (0.0 to 1.0)
-    """
-    if isinstance(contact_history, torch.Tensor):
-        contact_history = contact_history.cpu().numpy()
-    
-    steps, num_legs = contact_history.shape
-    if steps == 0:
-        return np.zeros(num_legs)
-        
-    # Count contacts
-    contact_counts = np.sum(contact_history > threshold, axis=0)
-    return contact_counts / steps
+def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
+    policy_cfg = agent_cfg_dict.get("policy")
+    if isinstance(policy_cfg, dict):
+        for name in ("actor", "critic", "student", "teacher"):
+            if isinstance(policy_cfg.get(name), dict):
+                policy_cfg[name].setdefault("class_name", "MLP")
+    algorithm_cfg = agent_cfg_dict.get("algorithm")
+    if isinstance(algorithm_cfg, dict):
+        for key in ("optimizer", "config_class", "share_cnn_encoders"):
+            algorithm_cfg.pop(key, None)
+    return agent_cfg_dict
 
-@hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Play with RSL-RL agent and compute duty factor."""
-    # override configurations with non-hydra CLI arguments
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
 
-    # Optional: use flat/other terrain for play.
-    # Keep task cfg (obs/action spaces, reward terms, result format) unchanged for checkpoint compatibility.
-    if args_cli.flat and not args_cli.play_env:
-        args_cli.play_env = "Isaac-Velocity-Flat-Unitree-Go1-v0"
-    play_env_id = args_cli.task
-    if args_cli.play_env:
-        device = args_cli.device or getattr(env_cfg.sim, "device", "cuda:0")
-        num_envs_override = args_cli.num_envs if args_cli.num_envs is not None else getattr(env_cfg.scene, "num_envs", 10)
-        play_env_cfg = parse_env_cfg(
-            args_cli.play_env,
-            device=device,
-            num_envs=num_envs_override,
-        )
-        # Replace only terrain-related config from the target play env.
-        if hasattr(env_cfg, "scene") and hasattr(play_env_cfg, "scene") and hasattr(play_env_cfg.scene, "terrain"):
-            env_cfg.scene.terrain = play_env_cfg.scene.terrain
-        if (
-            hasattr(env_cfg, "curriculum")
-            and hasattr(play_env_cfg, "curriculum")
-            and hasattr(play_env_cfg.curriculum, "terrain_levels")
-        ):
-            env_cfg.curriculum.terrain_levels = play_env_cfg.curriculum.terrain_levels
-        print(f"[INFO] Applied terrain from env: {args_cli.play_env} (policy/task cfg kept from: {args_cli.task})")
+@hydra_task_config(config.train.task, config.train.agent)
+def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint 없음: {checkpoint_path}")
+    out_dir = checkpoint_path.parent
 
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    env_cfg.seed = agent_cfg.seed
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    seed = args.seed if args.seed is not None else config.train.seed
+    device = config.common.get("device", "cuda:0")
+    agent_cfg.seed = seed
+    agent_cfg.device = device
+    if config.phase in {"phase1", "phase2", "phase3"}:
+        agent_cfg.policy.noise_std_type = config.exploration.noise_std_type
+        agent_cfg.policy.init_noise_std = config.exploration.init_noise_std
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    
-    # find checkpoint
-    if args_cli.checkpoint:
-        resume_path = args_cli.checkpoint
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    
-    # create environment (task id stays the same; terrain may be overridden above)
-    env = gym.make(play_env_id, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    
-    # 고장 다리 calf action masking 적용
-    env = PegLegActionMaskWrapper(env)
+    env_cfg.scene.num_envs = args.num_envs
+    env_cfg.sim.device = device
+    env_cfg.seed = seed
+    env_cfg.apply_environment_settings(
+        config.environment.values, int(agent_cfg.num_steps_per_env)
+    )
 
-    # wrap for rsl-rl
+    # balanced 고정 배정: env_id % 5 → Normal/FL/FR/RL/RR
+    peg_event = env_cfg.events.randomize_peg_leg_actuation
+    if peg_event is None:
+        raise RuntimeError("peg_leg.enabled=true 환경에서만 사용할 수 있습니다.")
+    peg_event.params["target_leg"] = "balanced_env"
+    peg_event.params["healthy_slots"] = 1
+    if getattr(env_cfg.curriculum, "peg_leg_difficulty", None) is not None:
+        env_cfg.curriculum.peg_leg_difficulty = None
+
+    env = gym.make(config.train.task, cfg=env_cfg, render_mode=None)
+    base = env.unwrapped
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    
-    # load policy
-    from rsl_rl.runners import OnPolicyRunner, DistillationRunner
-    
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    
-    runner.load(resume_path)
 
-    # play.py와 동일하게 policy를 JIT/ONNX로 export
-    try:
-        # rsl-rl >= 2.3
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # rsl-rl <= 2.2
-        policy_nn = runner.alg.actor_critic
+    agent_cfg_dict = patch_rsl_rl_agent_cfg(agent_cfg.to_dict())
+    runner_cls = OnPolicyRunner if agent_cfg.class_name == "OnPolicyRunner" else DistillationRunner
+    runner = runner_cls(env=env, train_cfg=agent_cfg_dict, log_dir=None, device=device)
+    runner.load(str(checkpoint_path), load_optimizer=False, map_location=device)
+    policy = runner.get_inference_policy(device=base.device)
+    policy_nn = runner.alg.policy
+    has_aux = hasattr(policy_nn, "aux_predict")
 
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
+    contacts = base.scene["contact_forces"]
+    body_names = list(contacts.body_names)
+    foot_b = [body_names.index(f"{leg}_foot") for leg in LEG_NAMES]
+    splint_b = [body_names.index(f"{leg}_splint") for leg in LEG_NAMES]
 
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    N, T = args.num_envs, args.steps
+    print(f"[INFO] Checkpoint : {checkpoint_path}")
+    print(f"[INFO] 조건 배정   : balanced (env%5), N={N}, steps={T}")
+    print(f"[INFO] aux head   : {'있음 — L̂/μ̂ 추정 로깅' if has_aux else '없음 — 추정 생략'}")
 
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    
-    # reset environment
-    obs, _ = env.reset()
-    
-    # Get peg leg info
-    base_env = env.unwrapped
-    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    peg_leg_per_env = _get_peg_leg_per_env(base_env, env_ids)
-    
-    # Print environment configuration
-    print("\n" + "="*80)
-    print("환경 구성 및 의족 상태")
-    print("="*80)
-    
-    groups = {0: [], 1: [], 2: [], 3: [], 4: []}
-    leg_names = ["FL", "FR", "RL", "RR"]
-    
-    for env_id, leg_idx in peg_leg_per_env.items():
-        group = env_id % 5
-        groups[group].append(env_id)
-        
-        status = "온전한 상태" if leg_idx is None else f"{leg_names[leg_idx]} 의족"
-        print(f"Env {env_id:3d}: {status}")
-        
-    print("-" * 80)
-    print(f"그룹 0 (온전한 상태): {len(groups[0])}개")
-    for i in range(1, 5):
-        print(f"그룹 {i} ({leg_names[i-1]} 의족): {len(groups[i])}개")
-    print("="*80 + "\n")
-    
-    # Collect data
-    print(f"데이터 수집 중... ({args_cli.steps} 스텝)")
-    
-    # Store contact forces: (steps, num_envs, num_legs)
-    contact_forces_hist = []
-    
-    for i in range(args_cli.steps):
-        with torch.inference_mode():
+    # ── 수집 ──
+    force_hist = np.zeros((T, N, 4), np.float32)       # 다리별 유효 접촉력
+    gt_leg_h = np.zeros((T, N), np.int8)
+    gt_L_h = np.zeros((T, N), np.float32)
+    gt_mu_h = np.zeros((T, N), np.float32)
+    t_reset = np.zeros((T, N), np.float32)             # 리셋 후 경과 [s]
+    aux_h = np.zeros((T, N, 2), np.float32)
+    rls_h = np.zeros((T, N), np.float32)
+    dt = base.step_dt
+    since_reset = torch.zeros(N, device=base.device)
+
+    obs = env.get_observations()
+    with torch.inference_mode():
+        for t in range(T):
             actions = policy(obs)
-            # RslRlVecEnvWrapper returns (obs, rew, done, info) - 4 values
-            ret = env.step(actions)
-            if len(ret) == 5:
-                obs, _, _, _, _ = ret
-            else:
-                obs, _, _, _ = ret
-            
-            # Get contact forces
-            # Assuming sensor name is 'contact_forces'
-            try:
-                sensor = base_env.scene.sensors[args_cli.contact_sensor]
-                
-                # Debug: Print sensor body names once
-                if i == 0:
-                    print(f"\n[Sensor Debug] Sensor '{args_cli.contact_sensor}' body names:")
-                    for idx, name in enumerate(sensor.body_names):
-                        print(f"  {idx}: {name}")
-                
-                # Find foot indices dynamically if not done yet
-                if 'foot_indices' not in locals():
-                    foot_indices = []
-                    target_feet = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-                    for foot in target_feet:
-                        found = False
-                        for idx, body_name in enumerate(sensor.body_names):
-                            if foot in body_name:  # Match substring (e.g. "base/FL_foot")
-                                foot_indices.append(idx)
-                                found = True
-                                break
-                        if not found:
-                            print(f"Warning: Could not find index for {foot}")
-                            foot_indices.append(0) # Fallback to 0 to avoid crash
-                    
-                    if i == 0:
-                        print(f"[Sensor Debug] Mapped foot indices: {foot_indices}\n")
+            if has_aux:
+                aux_h[t] = policy_nn.aux_predict().cpu().numpy()
+            rls_h[t] = obs["policy"][:, 49].cpu().numpy()
+            obs, _, dones, _ = env.step(actions)
+            if getattr(policy_nn, "is_recurrent", False):
+                policy_nn.reset(dones)
 
-                forces = sensor.data.net_forces_w
-                
-                # Calculate magnitude
-                if args_cli.use_z_only:
-                    force_mag = torch.abs(forces[..., 2])
-                else:
-                    force_mag = torch.norm(forces, dim=-1)
-                
-                # Use mapped indices
-                feet_forces = force_mag[:, foot_indices]
-                
-                # Debug: Print max force every 100 steps
-                if i % 100 == 0:
-                    max_force = torch.max(feet_forces).item()
-                    mean_force = torch.mean(feet_forces).item()
-                    print(f"Step {i}: Max Force={max_force:.2f}, Mean Force={mean_force:.2f}")
-                
-                contact_forces_hist.append(feet_forces.cpu().numpy())
-                
-            except Exception as e:
-                if i == 0:
-                    print(f"Warning: Could not read contact forces: {e}")
-                
-        if i % 100 == 0:
-            print(f"Step {i}/{args_cli.steps}")
-            
-    # Process data
-    contact_forces_hist = np.array(contact_forces_hist) # (steps, num_envs, 4)
-    
-    # Calculate duty factor per env, per leg
-    # Thresholding
-    in_contact = contact_forces_hist > args_cli.contact_threshold
-    duty_factors = np.mean(in_contact, axis=0) # (num_envs, 4)
-    
-    # Calculate average force per env, per leg
-    avg_forces = np.mean(contact_forces_hist, axis=0) # (num_envs, 4)
+            f = contacts.data.net_forces_w
+            mag = f[..., 2].abs() if args.use_z_only else f.norm(dim=-1)
+            feet = mag[:, foot_b].clone()
+            leg_idx = base._peg_leg_index                     # (N,) -1=정상
+            inj = leg_idx >= 0
+            if bool(inj.any()):
+                rows = torch.nonzero(inj).squeeze(-1)
+                feet[rows, leg_idx[rows]] = mag[:, splint_b][rows, leg_idx[rows]]
+            force_hist[t] = feet.cpu().numpy()
+            gt_leg_h[t] = leg_idx.cpu().numpy()
+            gt_L_h[t] = base._peg_leg_splint_length.cpu().numpy()
+            gt_mu_h[t] = base._peg_leg_foot_friction.cpu().numpy()
+            t_reset[t] = since_reset.cpu().numpy()
+            since_reset += dt
+            since_reset[dones.view(-1) > 0] = 0.0
+            if t % 300 == 0:
+                print(f"  step {t}/{T}")
 
-    # -------------------------------------------------------------------------
-    # 1. Duty Factor Analysis
-    # -------------------------------------------------------------------------
-    print("\n" + "="*80)
-    print("Duty Factor 분석 결과")
-    print("="*80)
-    print(f"{'Group':<20} | {'FL':<8} | {'FR':<8} | {'RL':<8} | {'RR':<8} | {'Avg':<8}")
-    print("-" * 80)
-    
-    df_stats = {}
-    
-    # Normal Group (Group 0)
-    if groups[0]:
-        df_normal = duty_factors[groups[0]]
-        avg_normal = np.mean(df_normal, axis=0)
-        total_avg = np.mean(avg_normal)
-        print(f"{'Normal (No Peg)':<20} | {avg_normal[0]:.4f}   | {avg_normal[1]:.4f}   | {avg_normal[2]:.4f}   | {avg_normal[3]:.4f}   | {total_avg:.4f}")
-        df_stats['normal'] = avg_normal
-    
-    # Peg Leg Groups
-    for i in range(1, 5):
-        leg_name = leg_names[i-1]
-        if groups[i]:
-            df_peg = duty_factors[groups[i]]
-            avg_peg = np.mean(df_peg, axis=0)
-            total_avg = np.mean(avg_peg)
-            
-            row_str = f"{leg_name + ' Peg Leg':<20} | "
-            for j in range(4):
-                val = avg_peg[j]
-                if j == i-1:
-                    row_str += f"*{val:.4f}*  | "
-                else:
-                    row_str += f"{val:.4f}   | "
-            row_str += f"{total_avg:.4f}"
-            print(row_str)
-            df_stats[f'peg_{leg_name}'] = avg_peg
-            
-    print("-" * 80)
-    print("* 표시: 의족 다리")
-    print("="*80 + "\n")
+    # ── 그룹 배정 (balanced: env_id % 5) ──
+    groups = {g: [n for n in range(N) if n % 5 == g] for g in range(5)}
+    inj_mask = gt_leg_h >= 0
 
-    # -------------------------------------------------------------------------
-    # 2. Contact Force Analysis
-    # -------------------------------------------------------------------------
-    print("\n" + "="*80)
-    print("Contact Force (N) 분석 결과")
-    print("="*80)
-    print(f"{'Group':<20} | {'FL':<8} | {'FR':<8} | {'RL':<8} | {'RR':<8} | {'Avg':<8}")
-    print("-" * 80)
-    
-    force_stats = {}
-    
-    # Normal Group (Group 0)
-    if groups[0]:
-        force_normal = avg_forces[groups[0]]
-        avg_normal = np.mean(force_normal, axis=0)
-        total_avg = np.mean(avg_normal)
-        print(f"{'Normal (No Peg)':<20} | {avg_normal[0]:.2f}     | {avg_normal[1]:.2f}     | {avg_normal[2]:.2f}     | {avg_normal[3]:.2f}     | {total_avg:.2f}")
-        force_stats['normal'] = avg_normal
-    
-    # Peg Leg Groups
-    for i in range(1, 5):
-        leg_name = leg_names[i-1]
-        if groups[i]:
-            force_peg = avg_forces[groups[i]]
-            avg_peg = np.mean(force_peg, axis=0)
-            total_avg = np.mean(avg_peg)
-            
-            row_str = f"{leg_name + ' Peg Leg':<20} | "
-            for j in range(4):
-                val = avg_peg[j]
-                if j == i-1:
-                    row_str += f"*{val:.2f}*    | "
-                else:
-                    row_str += f"{val:.2f}     | "
-            row_str += f"{total_avg:.2f}"
-            print(row_str)
-            force_stats[f'peg_{leg_name}'] = avg_peg
-            
-    print("-" * 80)
-    print("* 표시: 의족 다리 (낮을수록 좋음/절뚝거림 성공)")
-    print("="*80 + "\n")
-    
-    # Visualization
-    if not args_cli.no_show and len(groups[0]) > 0:
-        try:
-            # Create a figure with two subplots
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-            x = np.arange(4)
-            width = 0.15
-            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd'] # Default matplotlib colors
-            
-            # --- Plot 1: Duty Factor ---
-            # Plot Normal
-            ax1.bar(x - 2*width, df_stats['normal'], width, label='Normal', alpha=0.9, color=colors[0])
-            
-            # Plot Peg Legs
-            for i in range(1, 5):
-                key = f'peg_{leg_names[i-1]}'
-                if key in df_stats:
-                    ax1.bar(x + (i-2)*width, df_stats[key], width, label=f'{leg_names[i-1]} Peg', alpha=0.8, color=colors[i])
-            
-            ax1.set_ylabel('Duty Factor')
-            ax1.set_title('Duty Factor (Contact Time Ratio)')
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(leg_names)
-            ax1.legend()
-            ax1.set_ylim(0, 1.0)
-            ax1.grid(True, axis='y', linestyle='--', alpha=0.3)
-            
-            # --- Plot 2: Contact Force ---
-            # Plot Normal
-            ax2.bar(x - 2*width, force_stats['normal'], width, label='Normal', alpha=0.9, color=colors[0])
-            
-            # Plot Peg Legs
-            for i in range(1, 5):
-                key = f'peg_{leg_names[i-1]}'
-                if key in force_stats:
-                    ax2.bar(x + (i-2)*width, force_stats[key], width, label=f'{leg_names[i-1]} Peg', alpha=0.8, color=colors[i])
-            
-            ax2.set_ylabel('Average Force (N)')
-            ax2.set_title('Contact Force Comparison')
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(leg_names)
-            ax2.legend()
-            ax2.grid(True, axis='y', linestyle='--', alpha=0.3)
-            
-            plt.tight_layout()
-            
-            # Save figure
-            save_path = os.path.join(os.path.dirname(resume_path), "gait_analysis.png")
-            plt.savefig(save_path)
-            print(f"Analysis plot saved to: {save_path}")
-            
-            if not args_cli.no_show:
-                plt.show()
-                
-        except Exception as e:
-            print(f"Plotting failed: {e}")
+    in_contact = force_hist > args.contact_threshold
+    duty = in_contact.mean(axis=0)                     # (N, 4)
+    avg_force = np.array([
+        [force_hist[in_contact[:, n, k], n, k].mean() if in_contact[:, n, k].any() else 0.0
+         for k in range(4)] for n in range(N)
+    ])
+
+    def print_table(title: str, data: np.ndarray, fmt: str):
+        print("\n" + "=" * 80)
+        print(title)
+        print("=" * 80)
+        print(f"{'Group':<16} | {'FL':<9} | {'FR':<9} | {'RL':<9} | {'RR':<9} | {'Avg':<8}")
+        print("-" * 80)
+        stats = {}
+        for g in range(5):
+            if not groups[g]:
+                continue
+            avg = data[groups[g]].mean(axis=0)
+            cells = []
+            for k in range(4):
+                v = format(avg[k], fmt)
+                cells.append(f"*{v}*".ljust(9) if g - 1 == k else f"{v}".ljust(9))
+            print(f"{GROUP_LABELS[g]:<16} | " + " | ".join(cells) + f" | {avg.mean():{fmt}}")
+            stats[g] = avg
+        print("-" * 80)
+        print("* 표시: 부상 다리 (부목 접촉 기준)")
+        return stats
+
+    df_stats = print_table("Duty Factor 분석 결과", duty, ".4f")
+    force_stats = print_table("Contact Force (N) 분석 결과 (접지 중 평균)", avg_force, ".2f")
+
+    # ── plot 1: gait_analysis.png (기존 형식 유지) ──
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    x = np.arange(4)
+    width = 0.15
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for ax, stats, ylabel, title in (
+        (ax1, df_stats, "Duty Factor", "Duty Factor (Contact Time Ratio)"),
+        (ax2, force_stats, "Average Force (N)", "Contact Force (injured leg = splint)"),
+    ):
+        for g in range(5):
+            if g in stats:
+                ax.bar(x + (g - 2) * width, stats[g], width,
+                       label=GROUP_LABELS[g], alpha=0.85, color=colors[g])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(x)
+        ax.set_xticklabels(LEG_NAMES)
+        ax.legend()
+        ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    ax1.set_ylim(0, 1.0)
+    plt.tight_layout()
+    gait_png = out_dir / "gait_analysis.png"
+    plt.savefig(gait_png, dpi=150)
+    print(f"\n[INFO] 저장: {gait_png}")
+
+    # ── 부목 추정 결과 ──
+    if has_aux:
+        ti, ni = np.where(inj_mask)
+        L_hat = aux_h[..., 0] * L_SCALE + L_PRIOR
+        mu_hat = aux_h[..., 1] * MU_SCALE + MU_PRIOR
+        rls_L = rls_h * L_SCALE + L_PRIOR
+
+        # μ̂ 누적평균: LSTM 순간 출력은 ~3 s 에서 포화하지만 (지수창 추정기),
+        # 요동이 참값 주위에서 대체로 무편향이라 에피소드 내 누적 평균이
+        # 더 정확하다 (실측: 10-20 s 구간 0.093 → 0.070). 초기 1 s 는
+        # 수렴 전 값이라 평균에서 제외한다.
+        WARM = max(1, int(round(1.0 / dt)))
+        mu_avg = np.full((T, N), np.nan, np.float32)
+        for n in range(N):
+            starts = [t for t in range(T) if t_reset[t, n] == 0.0]
+            for i, s in enumerate(starts):
+                e = starts[i + 1] if i + 1 < len(starts) else T
+                if e - s <= WARM:
+                    continue
+                seg = mu_hat[s:e, n]
+                csum = np.cumsum(seg[WARM:])
+                mu_avg[s + WARM:e, n] = csum / np.arange(1, e - s - WARM + 1)
+
+        errL = np.abs(L_hat - gt_L_h)[ti, ni]
+        errR = np.abs(rls_L - gt_L_h)[ti, ni]
+        errM = np.abs(mu_hat - gt_mu_h)[ti, ni]
+        errMA = np.abs(mu_avg - gt_mu_h)[ti, ni]        # NaN = 워밍업 구간
+        tr = t_reset[ti, ni]
+        conv = tr > 5.0
+        ma_ok = ~np.isnan(errMA)
+
+        print("\n" + "=" * 80)
+        print("부목 길이 · 마찰 추정 결과 (부상 env)")
+        print("=" * 80)
+        print(f"  aux L̂     : MAE median {np.median(errL)*1000:.1f} mm "
+              f"(90%: {np.quantile(errL, 0.9)*1000:.1f}), 수렴 후(>5s) "
+              f"{np.median(errL[conv])*1000:.1f} mm")
+        print(f"  RLS 채널 L̂: MAE median {np.median(errR)*1000:.1f} mm "
+              f"(90%: {np.quantile(errR, 0.9)*1000:.1f})")
+        print(f"  aux μ̂     : MAE median {np.median(errM):.3f} "
+              f"(90%: {np.quantile(errM, 0.9):.3f}), 수렴 후(>5s) "
+              f"{np.median(errM[conv]):.3f}   [상수 예측 "
+              f"{np.abs(gt_mu_h[ti, ni] - np.median(gt_mu_h[ti, ni])).mean():.3f}]")
+        print(f"  aux μ̂ 누적평균: MAE median {np.median(errMA[ma_ok]):.3f} "
+              f"(90%: {np.quantile(errMA[ma_ok], 0.9):.3f}), 수렴 후(>5s) "
+              f"{np.median(errMA[ma_ok & conv]):.3f}  ← 배포 권장 판독값")
+
+        # plot 2: estimation_analysis.png
+        fig2, axes = plt.subplots(2, 2, figsize=(14, 9))
+        bins = np.arange(0.0, min(20.0, T * dt), 0.5)
+
+        def conv_curve(ax, err, label, color, ls="-"):
+            bx, med = [], []
+            for b in bins:
+                m = (tr >= b) & (tr < b + 0.5) & ~np.isnan(err)
+                if m.sum() >= 20:
+                    bx.append(b + 0.25)
+                    med.append(np.median(err[m]))
+            ax.plot(bx, med, label=label, color=color, lw=2, ls=ls)
+
+        ax = axes[0, 0]
+        conv_curve(ax, errL * 1000, "aux head L̂", "#1f77b4")
+        conv_curve(ax, errR * 1000, "RLS channel L̂", "#ff7f0e")
+        ax.set_xlabel("time since reset [s]")
+        ax.set_ylabel("|L̂ − L| median [mm]")
+        ax.set_title("Splint length estimation convergence")
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+        ax = axes[0, 1]
+        sc = conv & (np.arange(len(ti)) % 5 == 0)      # 산점도 서브샘플
+        ax.scatter(gt_L_h[ti, ni][sc] * 1000, L_hat[ti, ni][sc] * 1000,
+                   s=4, alpha=0.25, color="#1f77b4")
+        ax.plot([320, 460], [320, 460], "k--", lw=1)
+        ax.set_xlabel("GT L [mm]")
+        ax.set_ylabel("aux L̂ [mm]")
+        ax.set_title("L̂ vs GT (converged, >5 s)")
+        ax.grid(alpha=0.3)
+
+        ax = axes[1, 0]
+        conv_curve(ax, errM, "aux head μ̂ (instant)", "#2ca02c")
+        conv_curve(ax, errMA, "aux μ̂ running mean", "#d62728")
+        base_mae = np.abs(gt_mu_h[ti, ni] - np.median(gt_mu_h[ti, ni])).mean()
+        ax.axhline(base_mae, color="gray", ls="--", lw=1, label="constant predictor")
+        ax.set_xlabel("time since reset [s]")
+        ax.set_ylabel("|μ̂ − μ| median")
+        ax.set_title("Splint friction estimation convergence")
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+        ax = axes[1, 1]
+        sm = sc & ~np.isnan(mu_avg[ti, ni])
+        ax.scatter(gt_mu_h[ti, ni][sm], mu_avg[ti, ni][sm],
+                   s=4, alpha=0.25, color="#d62728")
+        ax.plot([0.5, 1.5], [0.5, 1.5], "k--", lw=1)
+        ax.set_xlabel("GT μ")
+        ax.set_ylabel("aux μ̂ (running mean)")
+        ax.set_title("averaged μ̂ vs GT (converged, >5 s)")
+        ax.grid(alpha=0.3)
+
+        plt.tight_layout()
+        est_png = out_dir / "estimation_analysis.png"
+        plt.savefig(est_png, dpi=150)
+        print(f"[INFO] 저장: {est_png}")
 
     env.close()
-    simulation_app.close()
+
 
 if __name__ == "__main__":
-    main()
+    # simulation_app.close() 는 종료 시 세그폴트가 날 수 있어 (rollout_dump 와 동일)
+    # traceback 출력 후 os._exit 로 끝낸다.
+    import os
+    import traceback
+
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    sys.stdout.flush()
+    os._exit(0)
