@@ -300,7 +300,7 @@ reward:
       ramp_duration_steps: 40000
 
     injured_limb_load_duty_nonuse:  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
-      enabled: false #->survial_bonus용 기존 true
+      enabled: true
       weight: -1.5
       load_contact_threshold: 10.0
       min_duty_severe: 0.28
