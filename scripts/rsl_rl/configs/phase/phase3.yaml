@@ -10,7 +10,7 @@ train:
 checkpoint:
   mode: "distill" # warmstart, resume
   # Phase 2 teacher (부목 모델 v2)
-  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_13_20_39_04_phase2_s42_P2-splint-003-liverls/model_10998.pt
+  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_16_18_10_21_phase2_s42_P2-splint-004-0815/model_10998.pt
   student: ""
   load_optimizer: false # false, true
   reset_iteration: true

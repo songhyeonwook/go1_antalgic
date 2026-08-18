@@ -2,6 +2,7 @@
 logs/
 outputs/
 runs/
+test/dumps/
 biomech/
 pd_logs/
 wandb/
