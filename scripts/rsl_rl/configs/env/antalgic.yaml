@@ -127,8 +127,6 @@ observation:
   # privileged observation group 자체는 유지
   privileged:
     enabled: true
-    # teacher 의 μ(부목 마찰) 정보를 student 가 도달 가능한 추정 정확도
-    mu_noise_std: 0.15
 
 # Domain Randomization OK
 domain_randomization:

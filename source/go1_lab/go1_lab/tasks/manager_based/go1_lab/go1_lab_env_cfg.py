@@ -309,19 +309,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
         # [FL, FR, RL, RR, injured_flag, L, friction, lin_vel(3)]
 
-        # μ(부목 끝단 마찰) 정보 열화: teacher 는 feedforward 라 시간 평균으로
-        # 노이즈를 상쇄할 수 없으므로, per-step iid 노이즈 std ≈ student 의
-        # μ̂ 도달 정확도(±0.14, 미끄럼 특징 누적 회귀 상한)로 두면 distillation
-        # 타깃이 student 가 따라갈 수 있는 정보 수준이 된다.
-        # 다른 privileged term 은 noise cfg 가 없어 corruption 을 켜도 깨끗하다.
-        mu_noise_std = float(privileged_cfg.get("mu_noise_std", 0.0))
-        if mu_noise_std > 0.0:
-            from isaaclab.utils.noise import GaussianNoiseCfg
-
-            self.observations.privileged_obs.enable_corruption = True
-            self.observations.privileged_obs.peg_leg_foot_friction.noise = (
-                GaussianNoiseCfg(mean=0.0, std=mu_noise_std)
-            )
+        # (μ 추정 경로 제거됨 — mu_noise_std 노이즈 주입도 함께 폐기.
+        #  μ 채널은 차원 호환용으로 privileged 에 남되 깨끗한 GT 그대로 둔다.
+        #  근거: μ 는 antalgic 보행에서 비식별 + 정책 민감도 ~1% 실측,
+        #  주장은 'μ 강건성'으로 전환 — test/mu_robustness_report.py)
 
         # 부상 전 nominal 기준의 calf 관절각 4차원 추가
         if bool(cfg["use_calf_pos_nominal_rel"]):

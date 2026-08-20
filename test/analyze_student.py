@@ -269,26 +269,22 @@ def main():
     if aux_head is None:
         print("[S6] aux head 없음 — 구버전 체크포인트 (probe 결과만 유효)")
     else:
-        print("[S6] aux head [L̂, μ̂] 평가 (부상 env, 유효 구간 전체)")
+        print("[S6] aux head [L̂] 평가 (부상 env, 유효 구간 전체)")
         with torch.no_grad():
             pred = aux_head(
                 torch.tensor(lat[ti, ni], dtype=torch.float32).to(device)
             ).cpu().numpy()
         t_reset_all = t_reset[ti, ni]
         L_hat = pred[:, 0] * 0.06 + 0.39
-        mu_hat = pred[:, 1] * 0.5 + 1.0
         gt_L_s = d["gt_L"][ti, ni]
-        gt_mu_s = d["gt_mu"][ti, ni]
         report_probe("aux L̂  ", gt_L_s, L_hat, t_reset_all, 1000, "mm")
         # live RLS 채널과 비교 (obs 49 = L̂_norm — prior 상수면 오차가 고정값)
         rls_L = d["obs_policy"][ti, ni, 49] * 0.06 + 0.39
         err_rls = np.abs(rls_L - gt_L_s)
         print(f"  (비교) live RLS 채널 L̂: MAE median {np.median(err_rls)*1000:.1f} mm, "
               f"90% {np.quantile(err_rls, 0.9)*1000:.1f} mm")
-        report_probe("aux μ̂  ", gt_mu_s, mu_hat, t_reset_all, 1000, "e-3")
-        base = np.abs(gt_mu_s - np.median(gt_mu_s)).mean()
-        print(f"  (비교) 상수 예측 μ MAE = {base*1000:.0f}e-3, "
-              f"물리특징 회귀 상한 ≈ 140e-3")
+        # aux μ̂ 평가는 제거됨 — μ 추정은 연구 범위 밖 (μ 강건성으로 전환).
+        # latent 의 μ 비인코딩 진단은 [S2] probe 가 담당한다.
     print("=" * 78)
 
 

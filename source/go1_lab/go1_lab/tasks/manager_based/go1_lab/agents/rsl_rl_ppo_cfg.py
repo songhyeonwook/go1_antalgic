@@ -98,10 +98,16 @@ class Phase2InjuryRunnerCfg(BaseRunnerCfg):
 
 @configclass
 class StudentTeacherRecurrentAuxCfg(RslRlDistillationStudentTeacherRecurrentCfg):
-    """StudentTeacherRecurrent + latent 보조 예측 헤드 [L̂, μ̂]."""
+    """StudentTeacherRecurrent + latent 보조 예측 헤드 [L̂].
+
+    μ 헤드는 제거됨 — μ 는 antalgic 보행에서 비식별임이 실측됐고(근접 슬립 0%,
+    teacher 민감도 ~1%), 연구 주장을 '추정'에서 'μ 강건성'으로 전환
+    (test/mu_robustness_report.py: μ∈[0.3, 2.0] 전 구간 성능 평탄).
+    ⚠️ 이 변경 전에 학습된 P3 체크포인트(aux 2출력)는 구 설정으로만 로드 가능.
+    """
 
     class_name: str = "StudentTeacherRecurrentAux"
-    aux_num_targets: int = 2
+    aux_num_targets: int = 1
 
 
 @configclass
@@ -110,18 +116,16 @@ class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
 
     aux_targets 의 shift/scale 은 관측 정규화와 동일 규약:
       L: (L − RLS_L_PRIOR) / RLS_L_SCALE  (rls_estimate 채널과 일치)
-      μ: (μ − 1.0) / 0.5                  (foot_friction_range [0.5, 1.5])
     """
 
     class_name: str = "DistillationAux"
     aux_loss_coef: float = 0.5
     # privileged_obs = [FL, FR, RL, RR, injured_flag, L, μ, lin_vel(3)]
+    # (μ 채널은 차원 호환을 위해 관측에 남지만 추정 대상이 아님)
     aux_mask: dict = {"group": "privileged_obs", "index": 4}
     aux_targets: list = [
         {"name": "splint_length", "group": "privileged_obs", "index": 5,
          "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
-        {"name": "foot_friction", "group": "privileged_obs", "index": 6,
-         "shift": 1.0, "scale": 0.5},
     ]
 
 

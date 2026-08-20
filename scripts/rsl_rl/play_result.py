@@ -20,7 +20,6 @@ LEG_NAMES = ["FL", "FR", "RL", "RR"]
 GROUP_LABELS = ["Normal", "FL Peg", "FR Peg", "RL Peg", "RR Peg"]
 # rls_estimate / aux head 정규화 규약 (mdp/rls.py, DistillationAuxCfg 와 동일)
 L_PRIOR, L_SCALE = 0.39, 0.06
-MU_PRIOR, MU_SCALE = 1.0, 0.5
 
 parser = argparse.ArgumentParser(description="보행 지표 + 부목 추정 결과 추출 (RSL-RL)")
 parser.add_argument("--phase", type=int, choices=(1, 2, 3), default=3)
@@ -117,6 +116,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     policy = runner.get_inference_policy(device=base.device)
     policy_nn = runner.alg.policy
     has_aux = hasattr(policy_nn, "aux_predict")
+    # aux 헤드는 L̂ 단독 (μ 추정은 연구 범위에서 제외 — μ 강건성으로 전환).
+    # 구(2출력) 체크포인트도 aux_distillation.load_state_dict 가 L 헤드만
+    # 남기고 절단 로드하므로 여기서는 항상 1출력이다.
+    aux_w = int(policy_nn.aux_head.out_features) if has_aux else 0
 
     contacts = base.scene["contact_forces"]
     body_names = list(contacts.body_names)
@@ -126,15 +129,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     N, T = args.num_envs, args.steps
     print(f"[INFO] Checkpoint : {checkpoint_path}")
     print(f"[INFO] 조건 배정   : balanced (env%5), N={N}, steps={T}")
-    print(f"[INFO] aux head   : {'있음 — L̂/μ̂ 추정 로깅' if has_aux else '없음 — 추정 생략'}")
+    print(f"[INFO] aux head   : {'있음 — L̂ 추정 로깅' if has_aux else '없음 — 추정 생략'}")
 
     # ── 수집 ──
     force_hist = np.zeros((T, N, 4), np.float32)       # 다리별 유효 접촉력
     gt_leg_h = np.zeros((T, N), np.int8)
     gt_L_h = np.zeros((T, N), np.float32)
-    gt_mu_h = np.zeros((T, N), np.float32)
     t_reset = np.zeros((T, N), np.float32)             # 리셋 후 경과 [s]
-    aux_h = np.zeros((T, N, 2), np.float32)
+    aux_h = np.zeros((T, N, max(aux_w, 1)), np.float32)
     rls_h = np.zeros((T, N), np.float32)
     dt = base.step_dt
     since_reset = torch.zeros(N, device=base.device)
@@ -161,7 +163,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             force_hist[t] = feet.cpu().numpy()
             gt_leg_h[t] = leg_idx.cpu().numpy()
             gt_L_h[t] = base._peg_leg_splint_length.cpu().numpy()
-            gt_mu_h[t] = base._peg_leg_foot_friction.cpu().numpy()
             t_reset[t] = since_reset.cpu().numpy()
             since_reset += dt
             since_reset[dones.view(-1) > 0] = 0.0
@@ -232,32 +233,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     if has_aux:
         ti, ni = np.where(inj_mask)
         L_hat = aux_h[..., 0] * L_SCALE + L_PRIOR
-        mu_hat = aux_h[..., 1] * MU_SCALE + MU_PRIOR
         rls_L = rls_h * L_SCALE + L_PRIOR
-
-        # μ̂ 누적평균: LSTM 순간 출력은 ~3 s 에서 포화하지만 (지수창 추정기),
-        # 요동이 참값 주위에서 대체로 무편향이라 에피소드 내 누적 평균이
-        # 더 정확하다 (실측: 10-20 s 구간 0.093 → 0.070). 초기 1 s 는
-        # 수렴 전 값이라 평균에서 제외한다.
-        WARM = max(1, int(round(1.0 / dt)))
-        mu_avg = np.full((T, N), np.nan, np.float32)
-        for n in range(N):
-            starts = [t for t in range(T) if t_reset[t, n] == 0.0]
-            for i, s in enumerate(starts):
-                e = starts[i + 1] if i + 1 < len(starts) else T
-                if e - s <= WARM:
-                    continue
-                seg = mu_hat[s:e, n]
-                csum = np.cumsum(seg[WARM:])
-                mu_avg[s + WARM:e, n] = csum / np.arange(1, e - s - WARM + 1)
 
         errL = np.abs(L_hat - gt_L_h)[ti, ni]
         errR = np.abs(rls_L - gt_L_h)[ti, ni]
-        errM = np.abs(mu_hat - gt_mu_h)[ti, ni]
-        errMA = np.abs(mu_avg - gt_mu_h)[ti, ni]        # NaN = 워밍업 구간
         tr = t_reset[ti, ni]
         conv = tr > 5.0
-        ma_ok = ~np.isnan(errMA)
 
         print("\n" + "=" * 80)
         print("부목 길이 · 마찰 추정 결과 (부상 env)")
@@ -267,16 +248,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
               f"{np.median(errL[conv])*1000:.1f} mm")
         print(f"  RLS 채널 L̂: MAE median {np.median(errR)*1000:.1f} mm "
               f"(90%: {np.quantile(errR, 0.9)*1000:.1f})")
-        print(f"  aux μ̂     : MAE median {np.median(errM):.3f} "
-              f"(90%: {np.quantile(errM, 0.9):.3f}), 수렴 후(>5s) "
-              f"{np.median(errM[conv]):.3f}   [상수 예측 "
-              f"{np.abs(gt_mu_h[ti, ni] - np.median(gt_mu_h[ti, ni])).mean():.3f}]")
-        print(f"  aux μ̂ 누적평균: MAE median {np.median(errMA[ma_ok]):.3f} "
-              f"(90%: {np.quantile(errMA[ma_ok], 0.9):.3f}), 수렴 후(>5s) "
-              f"{np.median(errMA[ma_ok & conv]):.3f}  ← 배포 권장 판독값")
-
         # plot 2: estimation_analysis.png
-        fig2, axes = plt.subplots(2, 2, figsize=(14, 9))
+        fig2, axes = plt.subplots(1, 2, figsize=(14, 4.5), squeeze=False)
         bins = np.arange(0.0, min(20.0, T * dt), 0.5)
 
         def conv_curve(ax, err, label, color, ls="-"):
@@ -305,27 +278,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         ax.set_xlabel("GT L [mm]")
         ax.set_ylabel("aux L̂ [mm]")
         ax.set_title("L̂ vs GT (converged, >5 s)")
-        ax.grid(alpha=0.3)
-
-        ax = axes[1, 0]
-        conv_curve(ax, errM, "aux head μ̂ (instant)", "#2ca02c")
-        conv_curve(ax, errMA, "aux μ̂ running mean", "#d62728")
-        base_mae = np.abs(gt_mu_h[ti, ni] - np.median(gt_mu_h[ti, ni])).mean()
-        ax.axhline(base_mae, color="gray", ls="--", lw=1, label="constant predictor")
-        ax.set_xlabel("time since reset [s]")
-        ax.set_ylabel("|μ̂ − μ| median")
-        ax.set_title("Splint friction estimation convergence")
-        ax.legend()
-        ax.grid(alpha=0.3)
-
-        ax = axes[1, 1]
-        sm = sc & ~np.isnan(mu_avg[ti, ni])
-        ax.scatter(gt_mu_h[ti, ni][sm], mu_avg[ti, ni][sm],
-                   s=4, alpha=0.25, color="#d62728")
-        ax.plot([0.5, 1.5], [0.5, 1.5], "k--", lw=1)
-        ax.set_xlabel("GT μ")
-        ax.set_ylabel("aux μ̂ (running mean)")
-        ax.set_title("averaged μ̂ vs GT (converged, >5 s)")
         ax.grid(alpha=0.3)
 
         plt.tight_layout()

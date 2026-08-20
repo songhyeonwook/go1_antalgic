@@ -46,6 +46,8 @@ parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--condition", choices=("balanced", "train"), default="balanced",
                     help="balanced: env_id 고정 1:1:1:1:1 / train: 학습과 동일(env_fixed)")
 parser.add_argument("--fixed_x", type=float, default=None, help="전진 명령 고정 (기본: 샘플링)")
+parser.add_argument("--fixed_mu", type=float, default=None,
+                    help="부목 끝단 마찰 고정 (μ 강건성 스윕용, 기본: yaml 범위 샘플링)")
 parser.add_argument("--out", type=str, default=None, help="저장 경로 (.npz). 기본: dumps/<체크포인트명>.npz")
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
@@ -59,6 +61,10 @@ config = load_experiment_config(
 
 sys.argv = [sys.argv[0], *hydra_args,
             "hydra/job_logging=disabled", "hydra.output_subdir=null", "hydra.run.dir=."]
+
+if args.fixed_mu is not None and not (0.0 < args.fixed_mu <= 4.0):
+    parser.error(f"--fixed_mu 는 (0, 4] 범위여야 합니다: {args.fixed_mu} "
+                 "(음수는 PhysX 가 조용히 0 으로 클램프해 라벨-실측 불일치 발생)")
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -97,11 +103,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint 없음: {checkpoint_path}")
 
-    out_path = (
-        Path(args.out).expanduser().resolve()
-        if args.out
-        else SCRIPT_DIR / "dumps" / f"{checkpoint_path.parent.name}_{checkpoint_path.stem}_{args.condition}.npz"
-    )
+    if args.out:
+        out_path = Path(args.out).expanduser().resolve()
+    elif args.fixed_mu is not None:
+        # μ 스윕 계약: mu_robustness_report.py 가 이 이름을 읽는다.
+        # μ 를 파일명에 넣지 않으면 스윕 실행이 서로를 덮어쓴다.
+        out_path = SCRIPT_DIR / "dumps" / f"mu_sweep_{args.fixed_mu}.npz"
+    else:
+        out_path = (SCRIPT_DIR / "dumps" /
+                    f"{checkpoint_path.parent.name}_{checkpoint_path.stem}_{args.condition}.npz")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     seed = args.seed if args.seed is not None else config.train.seed
@@ -129,6 +139,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         peg_event.params["target_leg"] = "balanced_env"
         peg_event.params["healthy_slots"] = 1
     # "train" 은 yaml 그대로 (env_fixed, healthy_slots=4)
+
+    if args.fixed_mu is not None:
+        # μ 강건성 평가: 부목 끝단 마찰을 단일 값으로 고정 (DR 범위 밖 외삽 가능)
+        peg_event.params["foot_friction_range"] = (args.fixed_mu, args.fixed_mu)
 
     # 커리큘럼 제거 — 평가에서는 전체 L 범위 [0.33, 0.45] 를 그대로 샘플해야 한다
     if getattr(env_cfg.curriculum, "peg_leg_difficulty", None) is not None:
@@ -228,6 +242,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "seed": seed,
         "step_dt": float(base.step_dt),
         "fixed_x": args.fixed_x,
+        "fixed_mu": args.fixed_mu,
         "joint_names": joint_names,
         "leg_joint_names": leg_joint_names,
         "legs": list(LEGS),

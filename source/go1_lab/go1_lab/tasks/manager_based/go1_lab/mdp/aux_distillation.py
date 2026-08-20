@@ -3,35 +3,30 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Phase 3 distillation + 보조 예측 헤드 (splint 파라미터 [L̂, μ̂]).
+"""Phase 3 distillation + 보조 예측 헤드 (부목 길이 L̂ 단독).
 
 왜 보조 헤드인가
 ----------------
-P3-latent-001 분석(test/analyze_student.py)에서 student LSTM latent 는
-L 을 ~9 mm 수준으로만, μ 는 전혀(R²=0.05) 인코딩하지 않았다. 원인은 능력이
-아니라 유인이다: distillation loss 는 teacher action 모사뿐이고, teacher 의
-μ 의존 성분은 student 입장에서 예측 불가능한 노이즈라 평균화하는 것이 loss
-최적이다. 여기서는 latent(256) 위에 선형 헤드를 얹어 privileged GT [L, μ] 를
-직접 지도해 latent 가 두 파라미터를 인코딩할 '이유'를 만든다.
-
-  - 관측 차원 불변 → phase 1/2 체크포인트 호환 유지
-  - 배포 시 aux_predict() 로 [L̂_norm, μ̂_norm] 을 바로 읽음 (별도 추정기 불필요)
-  - 헤드 gradient 가 LSTM 까지 흐르므로 latent 표현 자체가 개선됨
+P3-latent-001 분석(test/analyze_student.py)에서 student LSTM latent 는 L 을
+~9 mm 수준으로만 인코딩했다. 원인은 능력이 아니라 유인이다: distillation
+loss 는 teacher action 모사뿐이라 latent 가 L 을 정밀하게 인코딩할 이유가
+없다. 여기서는 latent(256) 위에 선형 헤드를 얹어 privileged GT L 을 직접
+지도해 표현을 개선한다.
 
 손실
 ----
   total = behavior + λ · Σ_k MSE(head_k(latent), target_k_norm)   (부상 env 만)
 
-target 은 rollout 에 저장된 privileged 관측에서 읽는다. μ 채널은 학습 환경의
-mu_noise_std 노이즈가 얹힌 값이라 (unbiased) label noise 로 작용한다 — student
-가 도달 가능한 추정 정확도 이상으로 과신하지 않게 하는 의도된 설계.
-healthy env 는 L=μ=0 (더미) 이므로 injured_flag 로 마스킹한다.
+target 은 rollout 에 저장된 privileged 관측에서 읽는다.
+healthy env 는 L=0 (더미) 이므로 injured_flag 로 마스킹한다.
 
 사용: agents/rsl_rl_ppo_cfg.py 의 DistillRunnerCfg 가
 StudentTeacherRecurrentAux / DistillationAux 를 class_name 으로 지정한다.
 """
 
 from __future__ import annotations
+
+from .rls import RLS_L_PRIOR, RLS_L_SCALE
 
 try:
     import torch.nn as nn
@@ -51,10 +46,10 @@ class StudentTeacherRecurrentAux(StudentTeacherRecurrent):
     """StudentTeacherRecurrent + latent 선형 보조 헤드.
 
     act_inference() 가 마지막 memory 출력(latent)을 캐싱하고, aux_predict() 가
-    그 latent 에서 [L̂_norm, μ̂_norm] 등 aux_num_targets 차원을 예측한다.
+    그 latent 에서 aux_num_targets 차원(기본 1 = [L̂_norm])을 예측한다.
     """
 
-    def __init__(self, obs, obs_groups, num_actions, aux_num_targets: int = 2, **kwargs):
+    def __init__(self, obs, obs_groups, num_actions, aux_num_targets: int = 1, **kwargs):
         super().__init__(obs, obs_groups, num_actions, **kwargs)
         rnn_hidden_dim = kwargs.get("rnn_hidden_dim", 256)
         self.aux_head = nn.Linear(rnn_hidden_dim, aux_num_targets)
@@ -72,6 +67,22 @@ class StudentTeacherRecurrentAux(StudentTeacherRecurrent):
         if self._last_latent is None:
             raise RuntimeError("aux_predict() must be called after act_inference().")
         return self.aux_head(self._last_latent)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """구(2출력 [L̂, μ̂]) 체크포인트 호환: aux_head 를 현재 폭으로 잘라 로드.
+
+        구 순서가 [L, μ] 였으므로 앞 행 슬라이스가 정확히 L 헤드를 보존한다.
+        (μ 추정 제거 이후에도 P3-aux-001/002 등 과거 결과 재현 가능하게 유지)
+        """
+        w = state_dict.get("aux_head.weight")
+        n = self.aux_head.out_features
+        if w is not None and w.shape[0] > n:
+            state_dict = dict(state_dict)
+            state_dict["aux_head.weight"] = w[:n]
+            state_dict["aux_head.bias"] = state_dict["aux_head.bias"][:n]
+            print(f"[aux] 구 체크포인트 aux_head {w.shape[0]}→{n}출력으로 절단 로드 "
+                  "(L 헤드 보존, μ 헤드 폐기)", flush=True)
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 class DistillationAux(Distillation):
@@ -93,11 +104,11 @@ class DistillationAux(Distillation):
         super().__init__(policy, **kwargs)
         self.aux_loss_coef = float(aux_loss_coef)
         self.aux_mask = aux_mask or {"group": "privileged_obs", "index": 4}
+        # 기본은 L 단독 — μ 는 antalgic 보행에서 비식별(연구 주장: μ 강건성).
+        # 정규화 상수는 rls_estimate 관측 채널과 단일 소스(mdp/rls.py) 공유.
         self.aux_targets = aux_targets or [
             {"name": "splint_length", "group": "privileged_obs", "index": 5,
-             "shift": 0.39, "scale": 0.06},
-            {"name": "foot_friction", "group": "privileged_obs", "index": 6,
-             "shift": 1.0, "scale": 0.5},
+             "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
         ]
         n_head = self.policy.aux_head.out_features
         if n_head != len(self.aux_targets):
@@ -127,7 +138,7 @@ class DistillationAux(Distillation):
                 mean_behavior_loss += behavior_loss.item()
                 step_loss = behavior_loss
 
-                # 보조 지도 손실 (부상 env 만 — healthy 는 L=μ=0 더미)
+                # 보조 지도 손실 (부상 env 만 — healthy 는 L=0 더미)
                 mask = obs[self.aux_mask["group"]][:, self.aux_mask["index"]] > 0.5
                 if bool(mask.any()):
                     aux_pred = self.policy.aux_predict()

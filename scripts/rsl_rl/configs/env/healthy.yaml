@@ -112,9 +112,6 @@ observation:
   # (base_lin_vel 은 실기에 없는 신호라 policy 그룹에서 privileged 로 이동됨)
   privileged:
     enabled: true
-    # antalgic.yaml 과 동일 구조 유지 (healthy 는 부상 env 가 없어 μ term 이
-    # 상수 — 노이즈만 얹힘)
-    mu_noise_std: 0.15
 
 # Domain Randomization OK
 domain_randomization:
