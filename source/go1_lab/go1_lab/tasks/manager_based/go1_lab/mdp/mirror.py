@@ -182,13 +182,45 @@ def height_scan_mirror_perm(device: torch.device) -> torch.Tensor:
     return _HEIGHT_SCAN_PERM_CACHE[key]
 
 
-def mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
-    """Mirror the full policy observation: proprioception [0:48] + height scan.
+# 현재 antalgic/healthy policy 관측 레이아웃 (base_lin_vel/height_scan 없음):
+#   [0:3] base_ang_vel, [3:6] projected_gravity, [6:9] velocity_commands,
+#   [9:21] joint_pos, [21:33] joint_vel, [33:45] actions,
+#   [45:49] calf_pos_abs (FL, FR, RL, RR), [49:51] rls_estimate [L̂, √P]
+# ⚠️ 관측 구성이 바뀌면 (예: calf_pos_abs 제거 → dim 47) 여기도 함께 갱신할 것.
+POLICY_DIM_V2 = 51
+# 현재 privileged 레이아웃: [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
+PRIVILEGED_DIM_V2 = 9
 
-    Proprioception is handled by :func:`mirror_obs`. If a 187-ray height scan is
-    present (obs dim ≥ 235) its block is reflected about the sagittal axis with
-    :func:`height_scan_mirror_perm`. Any trailing dims are left untouched.
+
+def _mirror_policy_obs_v2(obs: torch.Tensor) -> torch.Tensor:
+    """현재 51차원 policy 관측의 좌우 미러 (레이아웃은 POLICY_DIM_V2 주석 참고)."""
+    m = obs.clone()
+    m[..., 0] = -obs[..., 0]  # wx (roll rate)
+    m[..., 2] = -obs[..., 2]  # wz (yaw rate)
+    m[..., 4] = -obs[..., 4]  # gy
+    m[..., 7] = -obs[..., 7]  # vy_cmd
+    m[..., 8] = -obs[..., 8]  # wz_cmd
+    m[..., 9:21] = mirror_joint_tensor(obs[..., 9:21])   # joint_pos
+    m[..., 21:33] = mirror_joint_tensor(obs[..., 21:33])  # joint_vel
+    m[..., 33:45] = mirror_joint_tensor(obs[..., 33:45])  # actions
+    m[..., 45] = obs[..., 46]  # calf_pos_abs FL↔FR (calf 는 pitch — 부호 유지)
+    m[..., 46] = obs[..., 45]
+    m[..., 47] = obs[..., 48]  # calf_pos_abs RL↔RR
+    m[..., 48] = obs[..., 47]
+    # [49:51] rls_estimate 는 mirror-invariant (스칼라 길이 추정 + 불확실도)
+    return m
+
+
+def mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
+    """Mirror the policy observation (layout dispatched by last dim).
+
+    dim 51 → current antalgic/healthy layout (:data:`POLICY_DIM_V2` 주석 참고).
+    else   → legacy proprioception [0:48] via :func:`mirror_obs`; if a 187-ray
+    height scan is present (obs dim ≥ 235) its block is reflected about the
+    sagittal axis with :func:`height_scan_mirror_perm`.
     """
+    if obs.shape[-1] == POLICY_DIM_V2:
+        return _mirror_policy_obs_v2(obs)
     m = mirror_obs(obs)  # mirrors [0:48], copies the remainder verbatim
     dim = obs.shape[-1]
     lo, hi = PROPRIO_DIM, PROPRIO_DIM + HEIGHT_SCAN_NUM_RAYS
@@ -199,14 +231,25 @@ def mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
 
 
 def mirror_privileged_obs(obs: torch.Tensor) -> torch.Tensor:
-    """Mirror the teacher privileged obs [injury_index, splint_length, friction].
+    """Mirror the teacher privileged obs (layout dispatched by last dim).
 
-    injury_index obs values are 0=normal, 1=FL, 2=FR, 3=RL, 4=RR (peg_leg_index
-    returns internal_idx+1). L-R mirror swaps FL↔FR (1↔2) and RL↔RR (3↔4);
-    splint length and friction are mirror-invariant.
+    dim 9 (현재): [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
+    dim 10 (μ 제거 이전 덤프): [FL, FR, RL, RR, injured_flag, L, μ, lin_vel(3)]
+      → one-hot FL↔FR (0↔1), RL↔RR (2↔3); flag/L/μ 유지; lin_vel 은 vy 부호 반전.
+    dim 3 (legacy): [injury_index, L, friction] — injury_index 값은 0=normal,
+      1=FL, 2=FR, 3=RL, 4=RR (peg_leg_index + 1) 스칼라이며 1↔2, 3↔4 로 스왑.
     """
+    dim = obs.shape[-1]
     m = obs.clone()
-    if obs.shape[-1] >= 1:
+    if dim in (PRIVILEGED_DIM_V2, PRIVILEGED_DIM_V2 + 1):
+        m[..., 0] = obs[..., 1]  # one-hot FL↔FR
+        m[..., 1] = obs[..., 0]
+        m[..., 2] = obs[..., 3]  # one-hot RL↔RR
+        m[..., 3] = obs[..., 2]
+        vy = 7 if dim == PRIVILEGED_DIM_V2 else 8
+        m[..., vy] = -obs[..., vy]
+        return m
+    if dim >= 1:
         idx = obs[..., 0]
         new = idx.clone()
         new = torch.where(idx == 1, torch.full_like(idx, 2.0), new)
@@ -221,12 +264,12 @@ def mirror_full_obs(obs):
     """Mirror a full policy-input observation for left/right canonicalization.
 
     Handles the actor input as either a flat tensor or a dict / TensorDict.
-    Flat layout = proprioception (48) [+ height_scan (187)] [+ privileged (3)].
-    The privileged tail (last 3 dims: injury_index, splint, friction) is detected
-    by total dim and mirrored via :func:`mirror_privileged_obs`; the leading
-    proprio (+height) part via :func:`mirror_policy_obs`. Used to fold the
-    bilaterally-symmetric env along its sagittal axis (FL↔FR AND RL↔RR), giving
-    EXACT left/right consistency for deployment regardless of learned equivariance.
+    Flat dims: 51 = current policy layout (privileged 없음), 60 = 현재
+    policy(51) + privileged(9) 연결, 238 = legacy proprio(48) + height(187)
+    + privileged tail(3). ⚠️ 51 은 더 이상 legacy "48+privileged(3)" 로
+    해석하지 않는다. Used to fold the bilaterally-symmetric env along its
+    sagittal axis (FL↔FR AND RL↔RR), giving EXACT left/right consistency for
+    deployment regardless of learned equivariance.
     """
     # dict / TensorDict with named groups
     if hasattr(obs, "keys") and not isinstance(obs, torch.Tensor):
