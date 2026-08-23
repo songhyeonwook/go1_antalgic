@@ -65,7 +65,6 @@ class Go1LabPrivilegedObsCfg(ObsGroup):
     # Teacher/critic 에게만 제공되는 privileged observation (sim 전용 GT)
     peg_leg_one_index = ObsTerm(func=mdp.peg_leg_one_hot)  # 부상 다리 one-hot(5)
     peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length)  # 부목 길이 L(1)
-    peg_leg_foot_friction = ObsTerm(func=mdp.peg_leg_foot_friction)  # 부목 끝단 마찰(1)
     # 실기 Go1 에는 몸통 선속도 측정이 없으므로 policy 그룹에서 제거하고 여기로
     # 이동 — teacher/critic 은 obs_groups 매핑으로 계속 사용, student 는 못 봄
     base_lin_vel = ObsTerm(func=mdp_base.base_lin_vel)  # (3)
@@ -307,12 +306,12 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
 
         # privileged observation group 설정 객체를 생성
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
-        # [FL, FR, RL, RR, injured_flag, L, friction, lin_vel(3)]
+        # [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
 
-        # (μ 추정 경로 제거됨 — mu_noise_std 노이즈 주입도 함께 폐기.
-        #  μ 채널은 차원 호환용으로 privileged 에 남되 깨끗한 GT 그대로 둔다.
-        #  근거: μ 는 antalgic 보행에서 비식별 + 정책 민감도 ~1% 실측,
-        #  주장은 'μ 강건성'으로 전환 — test/mu_robustness_report.py)
+        # (μ 채널은 privileged 에서도 제거 — μ 는 antalgic 보행에서 비식별
+        #  + 정책 민감도 ~1% 실측이라 teacher/critic 에게도 정보 가치가 없다.
+        #  부목 끝단 마찰의 물리 랜덤화(foot_friction_range)는 μ 강건성
+        #  주장의 근거이므로 유지 — test/mu_robustness_report.py)
 
         # 부상 전 nominal 기준의 calf 관절각 4차원 추가
         if bool(cfg["use_calf_pos_nominal_rel"]):

@@ -120,8 +120,7 @@ class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
 
     class_name: str = "DistillationAux"
     aux_loss_coef: float = 0.5
-    # privileged_obs = [FL, FR, RL, RR, injured_flag, L, μ, lin_vel(3)]
-    # (μ 채널은 차원 호환을 위해 관측에 남지만 추정 대상이 아님)
+    # privileged_obs = [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
     aux_mask: dict = {"group": "privileged_obs", "index": 4}
     aux_targets: list = [
         {"name": "splint_length", "group": "privileged_obs", "index": 5,
