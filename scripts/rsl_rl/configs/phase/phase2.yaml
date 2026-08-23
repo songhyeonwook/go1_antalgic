@@ -5,7 +5,7 @@ train:
 
   num_envs: 2048
   max_iterations: 6000 # 8000, 500
-  seed: 42
+  seed: 44 #43 #42
 
 checkpoint:
   mode: "warmstart" # warmstart, resume

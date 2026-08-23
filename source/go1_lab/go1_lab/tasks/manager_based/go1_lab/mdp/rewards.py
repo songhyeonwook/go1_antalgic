@@ -45,10 +45,12 @@ def _foot_force_tensor(env: "ManagerBasedRLEnv", sensor_name: str, use_z_only: b
     try:
         contact_sensor = env.scene[sensor_name]
     except Exception:
+        print(f"[WARN] ContactSensor '{sensor_name}' not found in scene. Returning zeros.")
         return torch.zeros((env.num_envs, 4), device=env.device), [None, None, None, None]
 
     contact_forces_data = contact_sensor.data.net_forces_w
     if contact_forces_data is None:
+        print(f"[WARN] ContactSensor '{sensor_name}' has no net_forces_w data. Returning zeros.")
         return torch.zeros((env.num_envs, 4), device=env.device), [None, None, None, None]
 
     foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
