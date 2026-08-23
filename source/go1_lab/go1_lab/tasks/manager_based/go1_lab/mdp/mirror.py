@@ -284,9 +284,13 @@ def mirror_full_obs(obs):
         return out
     # flat tensor
     dim = obs.shape[-1]
-    priv = dim in (PROPRIO_DIM + 3, PROPRIO_DIM + HEIGHT_SCAN_NUM_RAYS + 3)  # 51 or 238
+    if dim == POLICY_DIM_V2 + PRIVILEGED_DIM_V2:  # 60: 현재 policy + privileged
+        m = _mirror_policy_obs_v2(obs[..., :POLICY_DIM_V2])
+        mp = mirror_privileged_obs(obs[..., POLICY_DIM_V2:])
+        return torch.cat([m, mp], dim=-1)
+    priv = dim == PROPRIO_DIM + HEIGHT_SCAN_NUM_RAYS + 3  # 238 (legacy)
     body = obs[..., :-3] if priv else obs
-    m = mirror_policy_obs(body)
+    m = mirror_policy_obs(body)  # 51 은 여기서 현재 레이아웃으로 처리됨
     if priv:
         m = torch.cat([m, mirror_privileged_obs(obs[..., -3:])], dim=-1)
     return m
@@ -304,8 +308,8 @@ def compute_symmetric_states(env, obs: TensorDict | None = None, actions: torch.
     Used by FEEDFORWARD policies (e.g. the RMA MLP teacher) via
     ``RslRlSymmetryCfg(use_data_augmentation=True)``. Each observation group is
     mirrored with the appropriate transform:
-      - "policy"          → proprioception (48) + height-scan grid (187)
-      - "privileged_obs"  → injury index FL↔FR / RL↔RR (splint, friction kept)
+      - "policy"          → 51차원 현재 레이아웃 (legacy 48+height_scan 도 지원)
+      - "privileged_obs"  → one-hot FL↔FR / RL↔RR + lin_vel vy 반전 (flag, L 유지)
     Actions get the 12-joint L/R swap + hip-abduction sign flip. The reward is
     never touched — this enforces left/right equivariance structurally.
 
