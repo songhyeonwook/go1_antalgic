@@ -35,6 +35,7 @@ RSL_DIR = SCRIPT_DIR.parent / "scripts" / "rsl_rl"
 sys.path.insert(0, str(RSL_DIR))
 
 from utils.config_builder import load_experiment_config  # noqa: E402
+from utils.rsl_rl_compat import patch_rsl_rl_agent_cfg  # noqa: E402
 
 parser = argparse.ArgumentParser(description="정책 롤아웃을 npz 로 덤프")
 parser.add_argument("--phase", type=int, choices=(2, 3), default=2)
@@ -48,6 +49,10 @@ parser.add_argument("--condition", choices=("balanced", "train"), default="balan
 parser.add_argument("--fixed_x", type=float, default=None, help="전진 명령 고정 (기본: 샘플링)")
 parser.add_argument("--fixed_mu", type=float, default=None,
                     help="부목 끝단 마찰 고정 (μ 강건성 스윕용, 기본: yaml 범위 샘플링)")
+parser.add_argument("--l_obs_fixed", type=float, default=None,
+                    help="정책에 주입할 GT L 채널값 고정 [m] — 물리 부목 길이는 그대로 (L 민감도용)")
+parser.add_argument("--l_obs_offset", type=float, default=None,
+                    help="정책의 GT L 채널에 더할 오프셋 [m] — 물리는 그대로")
 parser.add_argument("--out", type=str, default=None, help="저장 경로 (.npz). 기본: dumps/<체크포인트명>.npz")
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
@@ -84,19 +89,6 @@ import go1_lab.tasks  # noqa: F401, E402
 LEGS = ("FL", "FR", "RL", "RR")
 
 
-def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
-    policy_cfg = agent_cfg_dict.get("policy")
-    if isinstance(policy_cfg, dict):
-        for name in ("actor", "critic", "student", "teacher"):
-            if isinstance(policy_cfg.get(name), dict):
-                policy_cfg[name].setdefault("class_name", "MLP")
-    algorithm_cfg = agent_cfg_dict.get("algorithm")
-    if isinstance(algorithm_cfg, dict):
-        for key in ("optimizer", "config_class", "share_cnn_encoders"):
-            algorithm_cfg.pop(key, None)
-    return agent_cfg_dict
-
-
 @hydra_task_config(config.train.task, config.train.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
@@ -105,6 +97,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
 
     if args.out:
         out_path = Path(args.out).expanduser().resolve()
+    elif args.l_obs_fixed is not None or args.l_obs_offset is not None:
+        tag = (f"fix{args.l_obs_fixed}" if args.l_obs_fixed is not None
+               else f"off{args.l_obs_offset:+g}")
+        out_path = SCRIPT_DIR / "dumps" / f"lsens_{tag}.npz"
     elif args.fixed_mu is not None:
         # μ 스윕 계약: mu_robustness_report.py 가 이 이름을 읽는다.
         # μ 를 파일명에 넣지 않으면 스윕 실행이 서로를 덮어쓴다.
@@ -199,9 +195,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"[INFO] 체크포인트: {checkpoint_path}")
     t0 = time.time()
 
+    # privileged 레이아웃: onehot(5) L(1) lin_vel(3) — flag=4, L=5 (μ 제거 이후에도 동일)
+    L_OBS_IDX, FLAG_OBS_IDX = 5, 4
+    _perturb_l = args.l_obs_fixed is not None or args.l_obs_offset is not None
+
+    def perturb(o):
+        """정책이 보는 GT L 채널만 조작 (부상 env 한정). 물리·기록 버퍼는 무손상."""
+        if not _perturb_l:
+            return o
+        o = o.clone()
+        p = o["privileged_obs"]
+        m = p[:, FLAG_OBS_IDX] > 0.5
+        if args.l_obs_fixed is not None:
+            p[m, L_OBS_IDX] = args.l_obs_fixed
+        if args.l_obs_offset is not None:
+            p[m, L_OBS_IDX] = p[m, L_OBS_IDX] + args.l_obs_offset
+        return o
+
     with torch.inference_mode():
         for step in range(args.warmup + T):
-            actions = policy(obs)
+            actions = policy(perturb(obs))
             obs, _, dones, _ = env.step(actions)
             if getattr(runner.alg.policy, "is_recurrent", False):
                 runner.alg.policy.reset(dones)
@@ -243,6 +256,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "step_dt": float(base.step_dt),
         "fixed_x": args.fixed_x,
         "fixed_mu": args.fixed_mu,
+        "l_obs_fixed": args.l_obs_fixed,
+        "l_obs_offset": args.l_obs_offset,
+        "l_obs_note": "정책 입력의 privileged L 채널만 조작 (부상 env 한정); 물리 부목 길이 = gt_L 은 무손상",
         "joint_names": joint_names,
         "leg_joint_names": leg_joint_names,
         "legs": list(LEGS),
