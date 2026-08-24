@@ -23,20 +23,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from dump_utils import quat_rot_inv_x
 
 HERE = Path(__file__).resolve().parent
 MUS = (0.3, 0.6, 1.0, 1.5, 2.0)
 TRAIN_RANGE = (0.5, 1.5)
 STANCE_N = 10.0
 DT = 0.02
-
-
-def quat_rot_inv_x(quat, v):
-    """world 벡터 v 를 body x 축으로 투영 (R^T v 의 x 성분)."""
-    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
-    # body x축의 world 표현 = R @ [1,0,0]
-    bx = np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], -1)
-    return (bx * v).sum(-1)
 
 
 def metrics(path):

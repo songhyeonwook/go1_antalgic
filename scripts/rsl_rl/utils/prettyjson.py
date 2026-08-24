@@ -1,7 +1,3 @@
-import logging
-from pathlib import Path
-from typing import Any
-
 # https://stackoverflow.com/a/56497521/104668
 
 def prettyjson(obj, indent=2, maxlinelength=80):

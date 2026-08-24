@@ -28,14 +28,12 @@ parser.add_argument("--descriptor_name", type=str, default="policy_io.json")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-os.environ["GO1_PHASE"] = args_cli.phase
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import gymnasium as gym
-import torch
 
 from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
@@ -47,16 +45,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import go1_lab.tasks  # noqa: F401
 
 
-def _selected_phase3_checkpoint() -> str:
-    path = Path(__file__).resolve().parent / "logs" / "rsl_rl" / "unitree_go1_rough_student"
-    selected = path / "PAPER_GRADE_PHASE3_CHECKPOINT.txt"
-    if selected.is_file():
-        value = selected.read_text(encoding="utf-8").strip()
-        if value and value != "NO_PAPER_GRADE_CANDIDATE":
-            return value
-    raise FileNotFoundError(
-        "No selected Phase 3 checkpoint. Pass --checkpoint or run select_phase3_student_candidate.py first."
-    )
 
 
 def _normalizer(policy_nn):
@@ -69,7 +57,9 @@ def _normalizer(policy_nn):
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    checkpoint = os.path.abspath(args_cli.checkpoint or _selected_phase3_checkpoint())
+    if not args_cli.checkpoint:
+        raise SystemExit("--checkpoint 이 필요합니다 (내보낼 모델 .pt 경로).")
+    checkpoint = os.path.abspath(args_cli.checkpoint)
     if not os.path.isfile(checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 

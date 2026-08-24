@@ -78,18 +78,6 @@ def peg_leg_one_hot(env: "ManagerBasedRLEnv") -> torch.Tensor:
 
 @generic_io_descriptor(
     observation_type="PegLegPrivileged",
-    units="dimensionless",
-    on_inspect=[record_shape, record_dtype],
-)
-def peg_leg_foot_friction(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """부상 다리 부목 끝단의 마찰 계수를 반환합니다 (정상 = 0 sentinel)."""
-    if hasattr(env, "_peg_leg_foot_friction"):
-        return env._peg_leg_foot_friction.unsqueeze(-1)
-    return torch.zeros((env.num_envs, 1), device=env.device)
-
-
-@generic_io_descriptor(
-    observation_type="PegLegPrivileged",
     units="m",
     on_inspect=[record_shape, record_dtype],
 )

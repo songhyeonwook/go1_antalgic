@@ -36,7 +36,7 @@ source/go1_lab/                          Isaac Lab extension (the environment + 
     mdp/rewards.py                       reward terms incl. nociceptor pain (eq.4) + viability floors
     mdp/events.py                        injury injection, functional splint, L_peg / DR randomisation, curriculum
     mdp/observations.py                  proprioception + privileged injury observations
-    mdp/mirror.py, mdp/symmetric_ppo.py  left/right mirror augmentation (symmetry)
+    mdp/mirror.py                        left/right mirror transforms (symmetry reward)
     agents/rsl_rl_ppo_cfg.py             teacher (MLP) / student (LSTM) / distillation runner configs
   go1_lab/asset/                         Go1 and Go1-pegleg USD assets
 scripts/rsl_rl/

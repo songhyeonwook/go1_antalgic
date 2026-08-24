@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
-import os
 import sys
 import time
 from pathlib import Path
@@ -10,6 +8,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from utils.config_builder import load_experiment_config
+from utils.rsl_rl_compat import patch_rsl_rl_agent_cfg
 
 
 # ============================================================
@@ -138,35 +137,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import go1_lab.tasks  # noqa: F401
 from go1_lab.splint import SPLINT_MAX, SPLINT_MIN
 
-from peg_leg_action_wrapper import PegLegActionMaskWrapper
-
-
-def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
-    policy_cfg = agent_cfg_dict.get("policy")
-
-    if isinstance(policy_cfg, dict):
-        for component_name in (
-            "actor",
-            "critic",
-            "student",
-            "teacher",
-        ):
-            component_cfg = policy_cfg.get(component_name)
-
-            if isinstance(component_cfg, dict):
-                component_cfg.setdefault("class_name", "MLP")
-
-    algorithm_cfg = agent_cfg_dict.get("algorithm")
-
-    if isinstance(algorithm_cfg, dict):
-        for unsupported_key in (
-            "optimizer",
-            "config_class",
-            "share_cnn_encoders",
-        ):
-            algorithm_cfg.pop(unsupported_key, None)
-
-    return agent_cfg_dict
 
 
 @hydra_task_config(
@@ -385,7 +355,6 @@ def main(
 
     # # train.py와 동일하게 Phase2/3에서만 action mask 적용
     # if config.phase in ("phase2", "phase3"):
-    #     env = PegLegActionMaskWrapper(env)
 
     env = RslRlVecEnvWrapper(
         env,

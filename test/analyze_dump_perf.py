@@ -17,19 +17,10 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from dump_utils import quat_to_rot
 
 LEGS = ("FL", "FR", "RL", "RR")
 CONTACT_N = 5.0  # analyze_dump.py 와 동일한 접지 판정 힘
-
-
-def quat_to_rot(q):
-    """(..., 4) wxyz → (..., 3, 3)."""
-    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-        np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-        np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
-    ], -2)
 
 
 def env_groups(gt_leg):

@@ -16,6 +16,7 @@ from isaaclab.app import AppLauncher
 
 # added
 from utils.config_builder import ExperimentConfig, load_experiment_config, read_yaml
+from utils.rsl_rl_compat import patch_rsl_rl_agent_cfg
 from pathlib import Path
 from utils.prettyjson import prettyjson
 import json
@@ -170,11 +171,9 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
-    DirectMARLEnv,
     DirectMARLEnvCfg,
     DirectRLEnvCfg,
     ManagerBasedRLEnvCfg,
-    multi_agent_to_single_agent,
 )
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -306,48 +305,6 @@ def update_env_cfg(env_cfg, config: ExperimentConfig, log_dir: str, steps_per_it
     )
 
     return env_cfg
-
-def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
-    """RSL-RL 3.0.1+와의 설정 호환성을 위해 agent config를 수정한다.
-
-    처리 내용:
-    1. policy의 actor, critic, student, teacher 설정에 class_name이 없으면 기본값 "MLP"를 추가한다.
-    2. PPO 생성자가 지원하지 않는 algorithm 키를 제거한다.
-    """
-    policy_cfg = agent_cfg_dict.get("policy")
-
-    if isinstance(policy_cfg, dict):
-        policy_components = (
-            "actor",
-            "critic",
-            "student",
-            "teacher",
-        )
-
-        for component_name in policy_components:
-            component_cfg = policy_cfg.get(component_name)
-
-            if isinstance(component_cfg, dict):
-                component_cfg.setdefault(
-                    "class_name",
-                    "MLP",
-                )
-
-    algorithm_cfg = agent_cfg_dict.get("algorithm")
-
-    if isinstance(algorithm_cfg, dict):
-        unsupported_keys = (
-            "optimizer",
-            "config_class",
-            "share_cnn_encoders",
-        )
-
-        for key in unsupported_keys:
-            algorithm_cfg.pop(key, None)
-
-    return agent_cfg_dict    
-
-
 
 @hydra_task_config(
     config.train.task,

@@ -1,12 +1,7 @@
 import logging
-from logging.handlers import RotatingFileHandler
-
-from pathlib import Path
-
 import os
-
-import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 def redirect_python_streams(app_logger):
     sys.stdout = StreamToLogger(
@@ -80,7 +75,7 @@ def create_logger(
         if handler_config['class'] == 'logging.StreamHandler':
             handler = logging.StreamHandler()
         elif handler_config['class'] == 'logging.handlers.RotatingFileHandler':
-            handler = logging.handlers.RotatingFileHandler(
+            handler = RotatingFileHandler(
                 filename = full_dir,
                 maxBytes = handler_config.get('maxBytes', 0),
                 backupCount=handler_config.get('backupCount', 0)

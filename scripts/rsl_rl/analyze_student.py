@@ -481,9 +481,9 @@ def main(
             for k in o.keys():
                 v = o[k].clone()
                 if k == "policy":
-                    # "policy" may be concatenated [proprio(48)+privileged(3)] or
-                    # proprio-only; mirror_full_obs mirrors the privileged tail by
-                    # dim detection (so the injury index FR->FL gets mirrored).
+                    # "policy" 는 policy 단독이거나 privileged 가 뒤에 붙은 형태.
+                    # mirror_full_obs 가 차원으로 분해해 privileged 꼬리(부상
+                    # one-hot FR->FL)까지 미러링한다 (레이아웃은 mdp/mirror.py).
                     v[right] = _mir.mirror_full_obs(o[k][right])
                 elif k in ("privileged_obs", "privileged"):
                     v[right] = _mir.mirror_privileged_obs(o[k][right])

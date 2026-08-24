@@ -56,24 +56,6 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
 
 
-def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlBaseRunnerCfg:
-    """Parse configuration for RSL-RL agent based on inputs.
-
-    Args:
-        task_name: The name of the environment.
-        args_cli: The command line arguments.
-
-    Returns:
-        The parsed configuration for RSL-RL agent based on inputs.
-    """
-    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
-
-    # load the default configuration
-    rslrl_cfg: RslRlBaseRunnerCfg = load_cfg_from_registry(task_name, "rsl_rl_cfg_entry_point")
-    rslrl_cfg = update_rsl_rl_cfg(rslrl_cfg, args_cli)
-    return rslrl_cfg
-
-
 def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace):
     """Update configuration for RSL-RL agent based on inputs.
 

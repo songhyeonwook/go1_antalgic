@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from dump_utils import quat_to_rot
 
 LEGS = ("FL", "FR", "RL", "RR")
 
@@ -56,16 +57,6 @@ def ry(t):
         np.stack([c, z, s], -1),
         np.stack([z, o, z], -1),
         np.stack([-s, z, c], -1),
-    ], -2)
-
-
-def quat_to_rot(q):
-    """(..., 4) wxyz → (..., 3, 3)."""
-    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-        np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-        np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
     ], -2)
 
 
@@ -311,6 +302,7 @@ def main(path: str):
 
     try:
         import torch
+        torch.manual_seed(0)  # MLP 초기화/셔플 고정 — baseline 수치를 재현 가능하게
         H = 25
         env_ids = np.where(inj_mask.any(0))[0]
         rng = np.random.default_rng(0)
