@@ -14,6 +14,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from utils.config_builder import load_experiment_config
+from utils.rsl_rl_compat import patch_rsl_rl_agent_cfg
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LEG_NAMES = ["FL", "FR", "RL", "RR"]
@@ -59,19 +60,6 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper  # noqa: E
 import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import go1_lab.tasks  # noqa: F401, E402
-
-
-def patch_rsl_rl_agent_cfg(agent_cfg_dict: dict) -> dict:
-    policy_cfg = agent_cfg_dict.get("policy")
-    if isinstance(policy_cfg, dict):
-        for name in ("actor", "critic", "student", "teacher"):
-            if isinstance(policy_cfg.get(name), dict):
-                policy_cfg[name].setdefault("class_name", "MLP")
-    algorithm_cfg = agent_cfg_dict.get("algorithm")
-    if isinstance(algorithm_cfg, dict):
-        for key in ("optimizer", "config_class", "share_cnn_encoders"):
-            algorithm_cfg.pop(key, None)
-    return agent_cfg_dict
 
 
 @hydra_task_config(config.train.task, config.train.agent)
@@ -138,6 +126,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     t_reset = np.zeros((T, N), np.float32)             # 리셋 후 경과 [s]
     aux_h = np.zeros((T, N, max(aux_w, 1)), np.float32)
     rls_h = np.zeros((T, N), np.float32)
+    # rls_estimate 채널은 use_rls_estimate: false 면 관측에 없다 (policy dim 49 vs 51)
+    RLS_CH = 49
+    has_rls_ch = int(env.get_observations()["policy"].shape[-1]) > RLS_CH + 1
     dt = base.step_dt
     since_reset = torch.zeros(N, device=base.device)
 
@@ -147,7 +138,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             actions = policy(obs)
             if has_aux:
                 aux_h[t] = policy_nn.aux_predict().cpu().numpy()
-            rls_h[t] = obs["policy"][:, 49].cpu().numpy()
+            if has_rls_ch:
+                rls_h[t] = obs["policy"][:, RLS_CH].cpu().numpy()
             obs, _, dones, _ = env.step(actions)
             if getattr(policy_nn, "is_recurrent", False):
                 policy_nn.reset(dones)
@@ -246,8 +238,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         print(f"  aux L̂     : MAE median {np.median(errL)*1000:.1f} mm "
               f"(90%: {np.quantile(errL, 0.9)*1000:.1f}), 수렴 후(>5s) "
               f"{np.median(errL[conv])*1000:.1f} mm")
-        print(f"  RLS 채널 L̂: MAE median {np.median(errR)*1000:.1f} mm "
-              f"(90%: {np.quantile(errR, 0.9)*1000:.1f})")
+        if has_rls_ch:
+            print(f"  RLS 채널 L̂: MAE median {np.median(errR)*1000:.1f} mm "
+                  f"(90%: {np.quantile(errR, 0.9)*1000:.1f})")
+        else:
+            print("  RLS 채널 L̂: 관측에 없음 (use_rls_estimate: false) — 비교 생략")
         # plot 2: estimation_analysis.png
         fig2, axes = plt.subplots(1, 2, figsize=(14, 4.5), squeeze=False)
         bins = np.arange(0.0, min(20.0, T * dt), 0.5)
@@ -263,7 +258,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
 
         ax = axes[0, 0]
         conv_curve(ax, errL * 1000, "aux head L̂", "#1f77b4")
-        conv_curve(ax, errR * 1000, "RLS channel L̂", "#ff7f0e")
+        if has_rls_ch:
+            conv_curve(ax, errR * 1000, "RLS channel L̂", "#ff7f0e")
         ax.set_xlabel("time since reset [s]")
         ax.set_ylabel("|L̂ − L| median [mm]")
         ax.set_title("Splint length estimation convergence")

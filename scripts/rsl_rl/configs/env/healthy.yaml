@@ -92,10 +92,10 @@ observation:
   history_length: 1              # 현재 observation만 사용
   use_height_scan: false         # proprioception_only였는데 이름 변경 자기 상태 정보만 사용
 
-  use_calf_pos_nominal_rel: true
+  use_calf_pos_nominal_rel: false
 
   # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (Phase 2/3와 차원 일치용)
-  use_rls_estimate: true
+  use_rls_estimate: false
 
   # live RLS 파라미터 (healthy 는 부상 env 가 없어 항상 prior 에 머무름 —
   # antalgic.yaml 과 동일 구조 유지용)

@@ -3,25 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Phase 3 distillation + 보조 예측 헤드 (부목 길이 L̂ 단독).
+"""Phase 3 distillation + 보조 예측 헤드 (부목 길이 L̂ + 부상 다리 분류).
 
-왜 보조 헤드인가
-----------------
-P3-latent-001 분석(test/analyze_student.py)에서 student LSTM latent 는 L 을
-~9 mm 수준으로만 인코딩했다. 원인은 능력이 아니라 유인이다: distillation
-loss 는 teacher action 모사뿐이라 latent 가 L 을 정밀하게 인코딩할 이유가
-없다. 여기서는 latent(256) 위에 선형 헤드를 얹어 privileged GT L 을 직접
-지도해 표현을 개선한다.
 
 손실
 ----
-  total = behavior + λ · Σ_k MSE(head_k(latent), target_k_norm)   (부상 env 만)
+  total = behavior
+        + λ_reg · Σ_k MSE(head_k(latent), target_k_norm)      (부상 env 만)
+        + λ_cls · CE(cls_head(latent), 부상 다리 클래스)        (전 env)
 
-target 은 rollout 에 저장된 privileged 관측에서 읽는다.
-healthy env 는 L=0 (더미) 이므로 injured_flag 로 마스킹한다.
 
-사용: agents/rsl_rl_ppo_cfg.py 의 DistillRunnerCfg 가
-StudentTeacherRecurrentAux / DistillationAux 를 class_name 으로 지정한다.
 """
 
 from __future__ import annotations
@@ -29,6 +20,7 @@ from __future__ import annotations
 from .rls import RLS_L_PRIOR, RLS_L_SCALE
 
 try:
+    import torch
     import torch.nn as nn
 
     from rsl_rl.algorithms import Distillation
@@ -36,6 +28,7 @@ try:
 
     _HAS_RSL = True
 except Exception:  # pragma: no cover - rsl_rl absent outside training (e.g. list_envs)
+    torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
     Distillation = object  # type: ignore[assignment, misc]
     StudentTeacherRecurrent = object  # type: ignore[assignment, misc]
@@ -44,15 +37,16 @@ except Exception:  # pragma: no cover - rsl_rl absent outside training (e.g. lis
 
 class StudentTeacherRecurrentAux(StudentTeacherRecurrent):
     """StudentTeacherRecurrent + latent 선형 보조 헤드.
-
-    act_inference() 가 마지막 memory 출력(latent)을 캐싱하고, aux_predict() 가
-    그 latent 에서 aux_num_targets 차원(기본 1 = [L̂_norm])을 예측한다.
     """
 
-    def __init__(self, obs, obs_groups, num_actions, aux_num_targets: int = 1, **kwargs):
+    def __init__(self, obs, obs_groups, num_actions, aux_num_targets: int = 1,
+                 aux_num_classes: int = 5, **kwargs):
         super().__init__(obs, obs_groups, num_actions, **kwargs)
         rnn_hidden_dim = kwargs.get("rnn_hidden_dim", 256)
         self.aux_head = nn.Linear(rnn_hidden_dim, aux_num_targets)
+        self.aux_cls_head = (
+            nn.Linear(rnn_hidden_dim, aux_num_classes) if aux_num_classes > 0 else None
+        )
         self._last_latent = None
 
     def act_inference(self, obs):
@@ -68,12 +62,20 @@ class StudentTeacherRecurrentAux(StudentTeacherRecurrent):
             raise RuntimeError("aux_predict() must be called after act_inference().")
         return self.aux_head(self._last_latent)
 
-    def load_state_dict(self, state_dict, strict=True):
-        """구(2출력 [L̂, μ̂]) 체크포인트 호환: aux_head 를 현재 폭으로 잘라 로드.
+    def aux_predict_cls(self):
+        """직전 act_inference() latent 에서 부상 다리 분류 logits (softmax 이전).
 
-        구 순서가 [L, μ] 였으므로 앞 행 슬라이스가 정확히 L 헤드를 보존한다.
-        (μ 추정 제거 이후에도 P3-aux-001/002 등 과거 결과 재현 가능하게 유지)
+        확률이 필요하면 호출부에서 softmax 를 취한다 — 학습 손실은
+        cross_entropy 가 logits 를 직접 받으므로 여기서 취하지 않는다.
         """
+        if self.aux_cls_head is None:
+            raise RuntimeError("aux_cls_head 비활성 상태입니다 (aux_num_classes=0).")
+        if self._last_latent is None:
+            raise RuntimeError("aux_predict_cls() must be called after act_inference().")
+        return self.aux_cls_head(self._last_latent)
+
+    def load_state_dict(self, state_dict, strict=True):
+  
         w = state_dict.get("aux_head.weight")
         n = self.aux_head.out_features
         if w is not None and w.shape[0] > n:
@@ -82,11 +84,18 @@ class StudentTeacherRecurrentAux(StudentTeacherRecurrent):
             state_dict["aux_head.bias"] = state_dict["aux_head.bias"][:n]
             print(f"[aux] 구 체크포인트 aux_head {w.shape[0]}→{n}출력으로 절단 로드 "
                   "(L 헤드 보존, μ 헤드 폐기)", flush=True)
+        # 분류 헤드가 없던 구 체크포인트: 현재 초기값을 채워 strict 로드를 통과시킨다
+        if self.aux_cls_head is not None and "aux_cls_head.weight" not in state_dict:
+            state_dict = dict(state_dict)
+            state_dict["aux_cls_head.weight"] = self.aux_cls_head.weight.detach().clone()
+            state_dict["aux_cls_head.bias"] = self.aux_cls_head.bias.detach().clone()
+            print("[aux] 구 체크포인트에 aux_cls_head 없음 — 무작위 초기값으로 시작",
+                  flush=True)
         return super().load_state_dict(state_dict, strict=strict)
 
 
 class DistillationAux(Distillation):
-    """Distillation + 부상 env 마스킹된 보조 지도 손실.
+    """Distillation + 보조 지도 손실 (L 회귀 + 부상 다리 분류).
 
     parent 의 update() 흐름(스텝 순회, gradient_length 누적, hidden 관리)을
     그대로 유지하고 스텝 손실에 λ·aux 만 더한다. gradient clip 은 parent 와
@@ -99,13 +108,13 @@ class DistillationAux(Distillation):
         aux_loss_coef: float = 0.5,
         aux_mask: dict | None = None,
         aux_targets: list[dict] | None = None,
+        aux_cls_loss_coef: float = 0.5,
+        aux_cls: dict | None = None,
         **kwargs,
     ):
         super().__init__(policy, **kwargs)
         self.aux_loss_coef = float(aux_loss_coef)
         self.aux_mask = aux_mask or {"group": "privileged_obs", "index": 4}
-        # 기본은 L 단독 — μ 는 antalgic 보행에서 비식별(연구 주장: μ 강건성).
-        # 정규화 상수는 rls_estimate 관측 채널과 단일 소스(mdp/rls.py) 공유.
         self.aux_targets = aux_targets or [
             {"name": "splint_length", "group": "privileged_obs", "index": 5,
              "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
@@ -117,11 +126,34 @@ class DistillationAux(Distillation):
                 "policy.aux_num_targets 와 algorithm.aux_targets 를 맞추세요."
             )
 
+        # ── 부상 다리 분류 헤드 ──────────────────────────────────────────
+        # privileged one-hot 은 [FL, FR, RL, RR, injured_flag] 이므로
+        # 라벨 = flag 면 argmax(one_hot[0:4]), 아니면 normal_class.
+        self.aux_cls_loss_coef = float(aux_cls_loss_coef)
+        self.aux_cls = aux_cls if aux_cls is not None else {
+            "group": "privileged_obs", "leg_start": 0, "num_legs": 4,
+            "flag_index": 4, "normal_class": 4, "masked": False,
+        }
+        cls_head = getattr(self.policy, "aux_cls_head", None)
+        self._cls_on = cls_head is not None and bool(self.aux_cls)
+        if self._cls_on:
+            need = (int(self.aux_cls["num_legs"]) if self.aux_cls.get("masked")
+                    else int(self.aux_cls["normal_class"]) + 1)
+            if cls_head.out_features != need:
+                raise ValueError(
+                    f"aux_cls_head({cls_head.out_features}) 와 aux_cls 설정이 요구하는 "
+                    f"클래스 수({need}) 불일치 — policy.aux_num_classes 를 맞추세요 "
+                    f"(masked={bool(self.aux_cls.get('masked'))})."
+                )
+
     def update(self):
         self.num_updates += 1
         mean_behavior_loss = 0
         mean_aux = [0.0] * len(self.aux_targets)
         aux_cnt = 0
+        mean_cls = 0.0
+        mean_cls_acc = 0.0
+        cls_cnt = 0
         loss = 0
         cnt = 0
 
@@ -152,6 +184,30 @@ class DistillationAux(Distillation):
                         step_loss = step_loss + self.aux_loss_coef * aux_loss
                         mean_aux[j] += aux_loss.item()
                     aux_cnt += 1
+
+                # 부상 다리 분류 손실 (기본: 정상 클래스를 포함해 전 env 사용)
+                if self._cls_on:
+                    spec = self.aux_cls
+                    g = obs[spec["group"]]
+                    ls, nl = int(spec["leg_start"]), int(spec["num_legs"])
+                    flag = g[:, int(spec["flag_index"])] > 0.5
+                    leg = g[:, ls:ls + nl].argmax(dim=-1)
+                    if spec.get("masked"):
+                        sel, labels = flag, leg
+                    else:
+                        sel = torch.ones_like(flag)
+                        labels = torch.where(
+                            flag, leg, torch.full_like(leg, int(spec["normal_class"]))
+                        )
+                    if bool(sel.any()):
+                        logits = self.policy.aux_predict_cls()
+                        cls_loss = nn.functional.cross_entropy(logits[sel], labels[sel])
+                        step_loss = step_loss + self.aux_cls_loss_coef * cls_loss
+                        mean_cls += cls_loss.item()
+                        mean_cls_acc += (
+                            logits[sel].argmax(dim=-1) == labels[sel]
+                        ).float().mean().item()
+                        cls_cnt += 1
 
                 # total loss
                 loss = loss + step_loss
@@ -184,6 +240,9 @@ class DistillationAux(Distillation):
         loss_dict = {"behavior": mean_behavior_loss}
         for j, spec in enumerate(self.aux_targets):
             loss_dict[f"aux_{spec['name']}"] = mean_aux[j] / max(aux_cnt, 1)
+        if self._cls_on and cls_cnt:
+            loss_dict["aux_injured_leg"] = mean_cls / cls_cnt
+            loss_dict["aux_injured_leg_acc"] = mean_cls_acc / cls_cnt
 
         return loss_dict
 

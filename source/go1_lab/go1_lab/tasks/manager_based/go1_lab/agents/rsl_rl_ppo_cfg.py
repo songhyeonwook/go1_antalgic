@@ -14,7 +14,6 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
 )
 
-from go1_lab.tasks.manager_based.go1_lab.mdp import symmetric_ppo  # noqa: F401  registers SymmetricPPO
 from go1_lab.tasks.manager_based.go1_lab.mdp import aux_distillation  # noqa: F401  registers StudentTeacherRecurrentAux / DistillationAux
 from go1_lab.tasks.manager_based.go1_lab.mdp.rls import RLS_L_PRIOR, RLS_L_SCALE
 
@@ -98,21 +97,15 @@ class Phase2InjuryRunnerCfg(BaseRunnerCfg):
 
 @configclass
 class StudentTeacherRecurrentAuxCfg(RslRlDistillationStudentTeacherRecurrentCfg):
-    """StudentTeacherRecurrent + latent 보조 예측 헤드 [L̂].
-
-    μ 헤드는 제거됨 — μ 는 antalgic 보행에서 비식별임이 실측됐고(근접 슬립 0%,
-    teacher 민감도 ~1%), 연구 주장을 '추정'에서 'μ 강건성'으로 전환
-    (test/mu_robustness_report.py: μ∈[0.3, 2.0] 전 구간 성능 평탄).
-    ⚠️ 이 변경 전에 학습된 P3 체크포인트(aux 2출력)는 구 설정으로만 로드 가능.
-    """
-
     class_name: str = "StudentTeacherRecurrentAux"
     aux_num_targets: int = 1
+    # 부상 다리 분류 헤드: [FL, FR, RL, RR, 정상] 5-way (0 이면 헤드 미생성)
+    aux_num_classes: int = 5
 
 
 @configclass
 class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
-    """Distillation + 보조 지도 손실 (부상 env 마스킹).
+    """Distillation + 보조 지도 손실 (L 회귀 + 부상 다리 5-way 분류).
 
     aux_targets 의 shift/scale 은 관측 정규화와 동일 규약:
       L: (L − RLS_L_PRIOR) / RLS_L_SCALE  (rls_estimate 채널과 일치)
@@ -120,12 +113,20 @@ class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
 
     class_name: str = "DistillationAux"
     aux_loss_coef: float = 0.5
+    aux_cls_loss_coef: float = 0.5
     # privileged_obs = [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
     aux_mask: dict = {"group": "privileged_obs", "index": 4}
     aux_targets: list = [
         {"name": "splint_length", "group": "privileged_obs", "index": 5,
          "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
     ]
+    # 부상 다리 분류: one-hot[0:4] 이 다리, [4] 가 injured_flag.
+    # masked=False → 정상 env 를 normal_class 로 두고 전 env 학습 (5-way).
+    # masked=True  → 부상 env 한정 4-way (그 경우 aux_num_classes=4 로).
+    aux_cls: dict = {
+        "group": "privileged_obs", "leg_start": 0, "num_legs": 4,
+        "flag_index": 4, "normal_class": 4, "masked": False,
+    }
 
 
 @configclass

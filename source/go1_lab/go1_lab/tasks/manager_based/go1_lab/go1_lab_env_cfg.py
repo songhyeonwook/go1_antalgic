@@ -86,10 +86,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
    - 부상 다리 생성
    - curriculum 설정
    
-    3-phase 학습 파이프라인:
-      Phase 1 (GO1_PHASE=healthy): 정상 보행 pretrain
-      Phase 2 (GO1_PHASE=teacher): peg-leg 환경 + privileged obs → Teacher PPO
-      Phase 3 (GO1_PHASE=student): Teacher checkpoint 로드 → Student distill
+    3-phase 학습 파이프라인 (train.py --phase N, configs/phase/phaseN.yaml):
+      Phase 1: healthy.yaml  — 정상 보행 pretrain
+      Phase 2: antalgic.yaml — peg-leg 환경 + privileged obs → Teacher PPO
+      Phase 3: antalgic.yaml — Teacher checkpoint 동결 → Student distill
     """
     use_peg_leg: bool = None
     use_peg_leg_action_mask: bool = None
@@ -307,11 +307,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         # privileged observation group 설정 객체를 생성
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
         # [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
-
-        # (μ 채널은 privileged 에서도 제거 — μ 는 antalgic 보행에서 비식별
-        #  + 정책 민감도 ~1% 실측이라 teacher/critic 에게도 정보 가치가 없다.
-        #  부목 끝단 마찰의 물리 랜덤화(foot_friction_range)는 μ 강건성
-        #  주장의 근거이므로 유지 — test/mu_robustness_report.py)
 
         # 부상 전 nominal 기준의 calf 관절각 4차원 추가
         if bool(cfg["use_calf_pos_nominal_rel"]):
@@ -1017,7 +1012,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         
     
     def apply_environment_settings(self, settings: dict, steps_per_iteration: int, eval_peg_leg:str =None):
-        # phase = str(settings["name"]).strip().lower()
         steps_per_iteration = int(steps_per_iteration)
 
         self.use_peg_leg_action_mask = bool(settings["use_peg_leg_action_mask"])
