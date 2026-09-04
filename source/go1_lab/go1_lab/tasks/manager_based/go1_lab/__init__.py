@@ -17,9 +17,8 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.go1_lab_env_cfg:Go1LabEnvCfg",
-        # phase 별 runner 설정 (train.py 의 --phase 가 선택)
         "rsl_rl_phase1_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Phase1HealthyRunnerCfg",
         "rsl_rl_phase2_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Phase2InjuryRunnerCfg",
-        "rsl_rl_phase3_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:DistillRunnerCfg",
+        "rsl_rl_phase3_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Phase3DistillationRunnerCfg",
     },
 )

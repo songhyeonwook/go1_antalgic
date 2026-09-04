@@ -1,3 +1,5 @@
+# cd /home/robotserver/wj/go1_antalgic/scripts/rsl_rl && nohup /home/robotserver/wj/.venvs/isaaclab-5.1-antalgic/bin/python train.py --phase_config_path configs/phase/1/phase1.yaml --run_tag P1-001 --headless --debug_obs --debug_obs_envs 10 > logs/p1_001.out 2>&1 &
+
 train:
   project_name: unitree_go1_antalgic 
   task: Template-Go1-Lab-v0
@@ -5,7 +7,10 @@ train:
   
   num_envs: 2048
   max_iterations: 5000
+  normalize: false
   seed: 42
+
+  num_steps_per_env: 24
 
 checkpoint:
   mode: scratch
@@ -15,12 +20,14 @@ checkpoint:
   reset_iteration: true
 
 env:
-  path: ../env/healthy.yaml
+  path: ../../env/healthy.yaml
 
 
 eval:
   peg_leg: normal 
 
+
+# 덮어씌우는 부분 기능 수정
 exploration:
   noise_std:
     # 실제 사용할 탐색 노이즈 방식
@@ -30,9 +37,9 @@ exploration:
       scalar:
         init_noise_std: 1.0
         min_action_std: 0.001
-        enforce_min_std: true
 
       log:
         init_noise_std: 1.0
         min_action_std: 0.001
-        enforce_min_std: true
+
+overrides: {}

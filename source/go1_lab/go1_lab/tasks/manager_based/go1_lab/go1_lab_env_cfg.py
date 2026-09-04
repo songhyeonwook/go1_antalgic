@@ -16,7 +16,6 @@
 
 from isaaclab.actuators import DCMotorCfg, ImplicitActuatorCfg
 from isaaclab.envs import mdp as mdp_base
-from isaaclab.managers import CurriculumTermCfg as CurTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -47,11 +46,36 @@ from . import mdp
 from .mdp.events import (
     initialize_splint_presence,
     randomize_peg_leg_actuation,
-    peg_leg_curriculum,
     enforce_peg_leg_constraints,
 )
 
+def _validate_dynamics_endpoints(
+    splint_range, short_length: float, long_length: float, where: str
+) -> None:
+    """dynamics 보간 끝점이 실제 부목 길이 샘플 범위 안에 있는지 검사한다.
 
+    끝점이 범위 밖이면 그 바깥 구간이 전부 clamp 되어, 설정한 값이
+    실제로는 도달하지 않거나 보간 폭이 의도보다 좁아진다.
+    """
+    lo, hi = min(splint_range), max(splint_range)
+
+    if not short_length < long_length:
+        raise ValueError(
+            f"{where}: short_splint_length({short_length}) 는 "
+            f"long_splint_length({long_length}) 보다 작아야 합니다."
+        )
+
+    for name, value in (
+        ("short_splint_length", short_length),
+        ("long_splint_length", long_length),
+    ):
+        if not (lo <= value <= hi):
+            raise ValueError(
+                f"{where}.{name}={value} 가 peg_leg.splint_length_range "
+                f"[{lo}, {hi}] 밖입니다 — 그 구간이 전부 clamp 되어 "
+                "보간이 의도대로 작동하지 않습니다."
+            )
+        
 ##
 # Environment configuration
 ##
@@ -63,7 +87,6 @@ LEG_JOINT_PATTERNS = (".*_hip_joint", ".*_thigh_joint", ".*_calf_joint")
 @configclass
 class Go1LabPrivilegedObsCfg(ObsGroup):
     # Teacher/critic 에게만 제공되는 privileged observation (sim 전용 GT)
-    peg_leg_one_index = ObsTerm(func=mdp.peg_leg_one_hot)  # 부상 다리 one-hot(5)
     peg_leg_splint_length = ObsTerm(func=mdp.peg_leg_splint_length)  # 부목 길이 L(1)
     # 실기 Go1 에는 몸통 선속도 측정이 없으므로 policy 그룹에서 제거하고 여기로
     # 이동 — teacher/critic 은 obs_groups 매핑으로 계속 사용, student 는 못 봄
@@ -94,8 +117,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
     use_peg_leg: bool = None
     use_peg_leg_action_mask: bool = None
     grace_steps: int = None
-    # RLS live 갱신 파라미터 (None 이면 rls_estimate 채널이 prior 상수로 유지)
-    rls_params: dict = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -282,11 +303,14 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             yaw_abs,
         )
 
-    def _apply_observation_settings(self, cfg: dict) -> None:
-        self.observations.policy.history_length = int(
-            cfg["history_length"]
-        )
+        # ── heading 제어 비활성: yaw 를 직접 명령으로 샘플링한다 ──────────
+        # heading 제어는 로봇이 실제로 돌아야 오차가 줄어드는 폐루프라,
+        # 회전이 느린 부상 env 일수록 최대 회전 명령이 더 오래 유지된다.
+        # AT / FT / SYM 이 동일한 명령 분포를 겪어야 비교가 성립하므로 끈다.
+        self.commands.base_velocity.heading_command = False
+        ranges.heading = None      # heading_command=False 인데 남아 있으면 경고가 뜬다
 
+    def _apply_observation_settings(self, cfg: dict) -> None:
         # 지형 높이정보 제거
         if not bool(cfg["use_height_scan"]):
             if hasattr(self.observations.policy, "height_scan"):
@@ -308,35 +332,17 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         self.observations.privileged_obs = Go1LabPrivilegedObsCfg()
         # [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
 
-        # 부상 전 nominal 기준의 calf 관절각 4차원 추가
-        if bool(cfg["use_calf_pos_nominal_rel"]):
-            self.observations.policy.calf_pos_abs = ObsTerm(
-                func=mdp.calf_pos_nominal_rel
-            )
-        else:
-            self.observations.policy.calf_pos_abs = None
+        # 기존 policy정책에서 4개의 차원추가
+        self.observations.policy.peg_leg_one_hot = ObsTerm(func=mdp.peg_leg_one_hot)
 
-        # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (2차원).
-        # rls 블록이 있으면 live 갱신 (mdp/rls.py — 착지 등식 + 토크 게이트),
-        # 없으면 prior 상수 (차원 예약만). healthy phase 는 부상 env 가 없어
-        # live 여도 prior 에 머무르므로 두 경우가 동일하다.
-        if bool(cfg["use_rls_estimate"]):
-            self.observations.policy.rls_estimate = ObsTerm(
-                func=mdp.rls_estimate
-            )
-            if "rls" in cfg:
-                self.rls_params = {
-                    "torque_gate_nm": float(cfg["rls"]["torque_gate_nm"]),
-                    "foot_stance_n": float(cfg["rls"]["foot_stance_n"]),
-                    "update_stride": int(cfg["rls"]["update_stride"]),
-                    "meas_noise_std": float(cfg["rls"]["meas_noise_std"]),
-                    "innovation_gate_m": float(cfg["rls"]["innovation_gate_m"]),
-                    "min_axis_coef": float(cfg["rls"]["min_axis_coef"]),
-                }
-        
+
     def _apply_domain_randomization_settings(self, cfg) -> None:
         
         if not bool(cfg["enabled"]):
+            self.events.physics_material = None
+            self.events.add_base_mass = None
+            self.events.push_robot = None
+
             return
 
         from isaaclab.utils.noise import GaussianNoiseCfg
@@ -354,6 +360,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             self.events.physics_material.params[
                 "dynamic_friction_range"
             ] = tuple(float(v) for v in friction_cfg["dynamic_range"])
+        else:
+            self.events.physics_material = None
 
         mass_cfg = cfg["robot_mass"]
 
@@ -377,6 +385,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     "recompute_inertia": True,
                 },
             )
+        else:
+            self.events.add_base_mass = None
 
         push_cfg = cfg["random_push"]
 
@@ -400,6 +410,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     }
                 },
             )
+        else:
+            self.events.push_robot = None
 
         noise_cfg = cfg["observation_noise"]
 
@@ -409,10 +421,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 "joint_vel": "joint_vel_std",
                 "base_ang_vel": "base_ang_vel_std",
                 "projected_gravity": "projected_gravity_std",
-                "base_lin_vel": "base_lin_vel_std",
-                # live RLS 채널은 sim 에서 오라클급이므로 실기 추정 오차만큼
-                # 노이즈를 얹는다 (yaml 키가 없으면 노이즈 없이 유지)
-                "rls_estimate": "rls_estimate_std",
             }
 
             for term_name, yaml_key in noise_mapping.items():
@@ -544,31 +552,39 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         else:
             self.rewards.penalty_pain = None
 
-        splint_range = peg_leg_cfg["splint_length_range"]
-        splint_min, splint_max = min(splint_range), max(splint_range)
-        # 부목 모델 v2 의 심각도: nominal leg reach(≈0.31 m)에서 멀수록 어렵다.
-        # 긴 부목(=키다리)일수록 비대칭이 커지므로 severe=최대 길이, mild=최소 길이.
-        severe_len, mild_len = splint_max, splint_min
-
         # 부상 다리를 사용하지 않는 것에 대한 패널티 (부목 끝단이 지면에서 받는 힘 측정)
         force_cfg = cfg["injured_limb_force_nonuse"]
 
         if force_cfg['enabled']:
+            force_policy_cfg = force_cfg["force_policy"]
+            force_mode = str(force_policy_cfg["mode"]).strip().lower()
+            force_dyn_cfg = force_policy_cfg["dynamics"]
+
+            if force_mode == "dynamics":            
+                _validate_dynamics_endpoints(
+                    peg_leg_cfg["splint_length_range"],
+                    float(force_dyn_cfg["short_splint_length"]),
+                    float(force_dyn_cfg["long_splint_length"]),
+                    "injured_limb_force_nonuse.force_policy.dynamics",
+                )                                      
+
             self.rewards.injured_limb_force_nonuse = RewTerm(
                 func=mdp.penalize_injured_limb_force_nonuse, # 부상 다리의 평균 접촉력이 최소 목표보다 부족한지를 계산하는 함수
                 weight=float(force_cfg["weight"]),
                 params={
                     "sensor_name": "contact_forces",
-                    "severe_splint_length": severe_len,
-                    "mild_splint_length": mild_len,
-                    "min_force_severe": float(force_cfg['min_force_severe']),
-                    "min_force_mild": float(force_cfg['min_force_mild']),
+                    "force_dynamics": force_mode == "dynamics",
+                    "force_fixed": float(force_policy_cfg["fixed"]["value"]),
+                    "short_splint_length": float(force_dyn_cfg["short_splint_length"]),
+                    "short_splint_force": float(force_dyn_cfg["short_splint_force"]),
+                    "long_splint_length": float(force_dyn_cfg["long_splint_length"]),
+                    "long_splint_force": float(force_dyn_cfg["long_splint_force"]),
+
                     "front_leg_multiplier": float(force_cfg["front_leg_multiplier"]),
                     "rear_leg_multiplier": float(force_cfg["rear_leg_multiplier"]),    
                     "ema_alpha": float(force_cfg["ema_alpha"]),
                     "ramp_start_steps": int(force_cfg["ramp_start_steps"]),
                     "ramp_duration_steps": int(force_cfg["ramp_duration_steps"]),
-                    "include_calf": bool(force_cfg["include_calf"]),
                 },
             )
         else:
@@ -580,6 +596,19 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         
         # 부상 다리가 일정 시간 동안 하중을 거의 전혀 받지 않는 상태, 즉 부상 다리를 계속 들고 3족 보행하는 것을 막는 페널티
         if duty_nonuse_cfg["enabled"]:
+
+            duty_policy_cfg = duty_nonuse_cfg["duty_policy"]
+            duty_mode = str(duty_policy_cfg["mode"]).strip().lower()
+            duty_dyn_cfg = duty_policy_cfg["dynamics"]
+
+            if duty_mode == "dynamics":                    
+                _validate_dynamics_endpoints(
+                    peg_leg_cfg["splint_length_range"],
+                    float(duty_dyn_cfg["short_splint_length"]),
+                    float(duty_dyn_cfg["long_splint_length"]),
+                    "injured_limb_load_duty_nonuse.duty_policy.dynamics",
+                )
+        
             self.rewards.injured_limb_load_duty_nonuse = RewTerm(
                 func=mdp.penalize_injured_limb_load_duty_nonuse,
                 weight=float(duty_nonuse_cfg["weight"]),
@@ -588,16 +617,14 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     "load_contact_threshold": float(
                         duty_nonuse_cfg["load_contact_threshold"]
                     ),
-                    
-                    "severe_splint_length": severe_len,
-                    "mild_splint_length": mild_len,
 
-                    "min_duty_severe": float(
-                        duty_nonuse_cfg["min_duty_severe"]
-                    ),
-                    "min_duty_mild": float(
-                        duty_nonuse_cfg["min_duty_mild"]
-                    ),
+                    "duty_dynamics": duty_mode == "dynamics",
+                    "duty_fixed": float(duty_policy_cfg["fixed"]["value"]),
+                    "short_splint_length": float(duty_dyn_cfg["short_splint_length"]),
+                    "short_splint_duty": float(duty_dyn_cfg["short_splint_duty"]),
+                    "long_splint_length": float(duty_dyn_cfg["long_splint_length"]),
+                    "long_splint_duty": float(duty_dyn_cfg["long_splint_duty"]),
+
                     "front_leg_multiplier": float(
                         duty_nonuse_cfg["front_leg_multiplier"]
                     ),
@@ -615,7 +642,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         else:
            self.rewards.injured_limb_load_duty_nonuse = None
 
-        
+
+            
     def _apply_reward_settings(self, cfg, peg_leg_cfg) -> None:
         
         task_cfg = cfg["task"]
@@ -630,6 +658,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             self.rewards.lin_vel_z_l2.weight = float(
                 task_cfg["linear_velocity_z_weight"]
             )
+        else:
+            self.rewards.track_lin_vel_xy_exp = None
+            self.rewards.track_ang_vel_z_exp = None
+            self.rewards.lin_vel_z_l2 = None
 
         gait_cfg = cfg["gait_tuning"]
 
@@ -643,6 +675,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
             self.rewards.ang_vel_xy_l2.weight = float(
                 gait_cfg["angular_velocity_xy_weight"]
             )
+        else:
+            self.rewards.feet_air_time = None
+            self.rewards.action_rate_l2 = None
+            self.rewards.ang_vel_xy_l2 = None
 
         energy_cfg = cfg["energy"]
 
@@ -652,9 +688,11 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         self.rewards.dof_acc_l2.weight *= float(
             energy_cfg["dof_acc_penalty_scale"]
         )
-        self.rewards.action_rate_l2.weight *= float(
-            energy_cfg["action_rate_penalty_scale"]
-        )
+
+        if self.rewards.action_rate_l2 is not None:
+            self.rewards.action_rate_l2.weight *= float(
+                energy_cfg["action_rate_penalty_scale"]
+            )
 
         posture_cfg = cfg["posture"]
 
@@ -676,7 +714,7 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         calf_contact_cfg = cfg['calf_contact']
         
         if bool(calf_contact_cfg['enabled']):
-            self.rewards.intact_calf_contact = RewTerm(
+            self.rewards.calf_contact = RewTerm(
                 func=mdp.penalize_knee_shin_contact,
                 weight=float(calf_contact_cfg["weight"]),
                 params={
@@ -688,7 +726,7 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 },
             )
         else:
-            self.rewards.intact_calf_contact = None
+            self.rewards.calf_contact = None
 
 
         alive_cfg = cfg["survival_bonus"]
@@ -699,6 +737,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 func=mdp_base.is_alive,
                 weight=float(alive_cfg["weight"]),
             )
+        else:
+            self.rewards.survival_bonus = None
 
         joint_mirror_cfg = cfg["joint_mirror_symmetry"]
         
@@ -730,7 +770,10 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                     "asset_cfg": SceneEntityCfg("robot"),
                 },
             )
-        
+        else:
+            self.terminations.root_too_low = None
+
+
         orientation_cfg = cfg["bad_orientation"]
         if bool(orientation_cfg["enabled"]):
             self.terminations.bad_orientation = DoneTerm(
@@ -806,101 +849,28 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         )
     
     
-    def _apply_curriculum_settings(self, cfg: dict,  steps_per_iteration: int, target_leg: str, healthy_slots: int):
-        if not cfg['enabled']:
-            return
-        
-        leg_cfg = cfg["leg_probability"]
-        splint_cfg = cfg["splint_length"]
-
-        # 부상 확률 curriculum
-        prob_initial = float(leg_cfg["initial"])
-        prob_final = float(leg_cfg["final"])
-        prob_iterations = int(leg_cfg["iterations"])
-
-        # 부목 길이 curriculum
-        initial_min = float(splint_cfg["initial_min"])
-        initial_max = float(splint_cfg["initial_max"])
-        final_min = float(splint_cfg["final_min"])
-        final_max = float(splint_cfg["final_max"])
-        splint_iterations = int(splint_cfg["iterations"])
-        
-        # 설정값 검증
-        if not 0.0 <= prob_initial <= 1.0:
-            raise ValueError(
-                f"leg_probability.initial must be in [0, 1], got {prob_initial}"
-            )
-
-        if not 0.0 <= prob_final <= 1.0:
-            raise ValueError(
-                f"leg_probability.final must be in [0, 1], got {prob_final}"
-            )
-
-        if prob_iterations <= 0:
-            raise ValueError(
-                f"leg_probability.iterations must be positive, got {prob_iterations}"
-            )
-
-        if splint_iterations <= 0:
-            raise ValueError(
-                f"splint_length.iterations must be positive, got {splint_iterations}"
-            )
-
-        if initial_min > initial_max:
-            raise ValueError(
-                "splint_length.initial_min must be less than or equal to initial_max"
-            )
-
-        if final_min > final_max:
-            raise ValueError(
-                "splint_length.final_min must be less than or equal to final_max"
-            )
-        
-        self.curriculum.peg_leg_difficulty = CurTerm(
-            func=peg_leg_curriculum,
-            params={
-                # 부상 확률: 0.1 -> 0.5
-                "prob_start": prob_initial,
-                "prob_end": prob_final,
-                "prob_ramp_steps": prob_iterations,
-
-                # 부목 길이 상한: 0.33 -> 0.30
-                "splint_start": initial_max,
-                "splint_end": final_max,
-
-                # 부목 길이 하한: 0.28 -> 0.20
-                "splint_lo_start": initial_min,
-                "splint_lo_end": final_min,
-
-                "splint_ramp_steps": splint_iterations,
-                "steps_per_iteration": steps_per_iteration,
-                "target_leg": target_leg,
-                "healthy_slots": healthy_slots,
-            },
-        )
-            
     
-    def _set_target_and_peg_leg_prob_for_eval(self, eval_peg_leg: str | None, target_leg: str, prob_peg_leg: float):
-        """평가 모드가 있으면 학습용 target/prob 값을 평가용으로 덮어쓴다."""
+    # def _set_target_and_peg_leg_prob_for_eval(self, eval_peg_leg: str | None, target_leg: str, prob_peg_leg: float):
+    #     """평가 모드가 있으면 학습용 target/prob 값을 평가용으로 덮어쓴다."""
 
-        # train.py에서 호출하면 평가 override가 없으므로 학습값 유지
-        if eval_peg_leg is None:
-            return target_leg, prob_peg_leg
+    #     # train.py에서 호출하면 평가 override가 없으므로 학습값 유지
+    #     if eval_peg_leg is None:
+    #         return target_leg, prob_peg_leg
 
-        eval_mode = eval_peg_leg.strip().lower()
+    #     eval_mode = eval_peg_leg.strip().lower()
 
-        if eval_mode == "normal":
-            return "normal", 0.0
+    #     if eval_mode == "normal":
+    #         return "normal", 0.0
 
-        if eval_mode in {"fl", "fr", "rl", "rr"}:
-            return eval_mode, 1.0
+    #     if eval_mode in {"fl", "fr", "rl", "rr"}:
+    #         return eval_mode, 1.0
 
-        if eval_mode == "balanced":
-            return "balanced_random", 0.8
+    #     if eval_mode == "balanced":
+    #         return "balanced_random", 0.8
 
-        raise ValueError(
-            f"Unsupported eval peg leg: {eval_mode!r}"
-        )
+    #     raise ValueError(
+    #         f"Unsupported eval peg leg: {eval_mode!r}"
+    #     )
 
          
     def _apply_peg_leg_event_settings(self, cfg: dict, steps_per_iteration: int, attach: str, eval_peg_leg:str = None) -> None:
@@ -929,26 +899,42 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
 
 
 
-        # 기본값은 antalgic.yaml의 학습 설정
-        target_leg = str(cfg["target_leg"]).strip().lower()
-        prob_peg_leg = max(0.0, min(1.0, float(cfg["prob_peg_leg"])))
+        # ── 부상 조건 배정 정책 ──────────────────────────────────────
+        #   env_fixed : env_id 로 고정 배정. 리셋해도 조건이 안 바뀌므로
+        #               부목 presence 토글(CPU USD 연산) 비용이 0 이고
+        #               조건별 학습 스텝 수가 구조적으로 균등하다. ← 학습 기본값
+        #   random    : 리셋마다 같은 분포에서 다시 추첨.
+        leg_policy_cfg = cfg["leg_policy"]
+        leg_mode = str(leg_policy_cfg["mode"]).strip().lower()
+        valid_leg_modes = {"env_fixed", "random"}
 
-
-        # test.py에서 평가값을 넘겼다면 평가용으로 덮어쓰기
-        target_leg, prob_peg_leg = (
-            self._set_target_and_peg_leg_prob_for_eval(
-                eval_peg_leg=eval_peg_leg,
-                target_leg=target_leg,
-                prob_peg_leg=prob_peg_leg,
+        if leg_mode not in valid_leg_modes:
+            raise ValueError(
+                "peg_leg.leg_policy.mode must be one of "
+                f"{sorted(valid_leg_modes)}, got {leg_mode!r}"
             )
+
+        leg_deterministic = leg_mode == "env_fixed"
+
+        ratio_cfg = leg_policy_cfg[leg_mode]
+        leg_ratios = tuple(
+            float(ratio_cfg[key]) for key in ("normal", "fl", "fr", "rl", "rr")
         )
+
+        if any(r < 0.0 for r in leg_ratios):
+            raise ValueError(
+                f"peg_leg.leg_policy.{leg_mode} 비율에 음수가 있습니다: {leg_ratios}"
+            )
+
+        ratio_sum = sum(leg_ratios)
+        if abs(ratio_sum - 1.0) > 1e-6:
+            raise ValueError(
+                f"peg_leg.leg_policy.{leg_mode} 비율 합이 1.0 이어야 합니다: {ratio_sum}"
+            )
 
         splint_range = tuple(float(value) for value in cfg["splint_length_range"])
         foot_friction_range = tuple(float(value) for value in cfg["foot_friction_range"])
         injured_splint_friction_only = bool(cfg["injured_splint_friction_only"])
-
-        # 부목길이
-        splint_range = (min(splint_range), max(splint_range))
 
         # 부목 끝단 마찰 계수
         foot_friction_range = (min(foot_friction_range), max(foot_friction_range))
@@ -964,23 +950,47 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         splint_calf_stiffness = float(splint_actuator_cfg["stiffness"])
         splint_calf_damping = float(splint_actuator_cfg["damping"])
 
-        healthy_slots = int(cfg["env_fixed_healthy_slots"])
+
+        # ── 부상 calf 접힘각 정책 ────────────────────────────────────
+        #   fixed  : fixed.value 를 모든 부상 env 에 동일 적용
+        #   random : [min_fold, 상한] 에서 균등 추첨.
+        #            상한 = clamp(발끝이 부목끝-padding 에 오는 각, min_fold, max_fold)
+        calf_policy_cfg = cfg["calf_policy"]
+        calf_mode = str(calf_policy_cfg["mode"]).strip().lower()
+        valid_calf_modes = {"fixed", "random"}
+
+        if calf_mode not in valid_calf_modes:
+            raise ValueError(
+                "peg_leg.calf_policy.mode must be one of "
+                f"{sorted(valid_calf_modes)}, got {calf_mode!r}"
+            )
+
+        calf_random_cfg = calf_policy_cfg["random"]
+        calf_min_fold = float(calf_random_cfg["min_fold"])
+        calf_max_fold = float(calf_random_cfg["max_fold"])
+
+        if not calf_min_fold < calf_max_fold:
+            raise ValueError(
+                f"peg_leg.calf_policy.random: min_fold({calf_min_fold}) 는 "
+                f"max_fold({calf_max_fold}) 보다 작아야 합니다 (더 음수 = 더 접힘)."
+            )
 
         self.events.randomize_peg_leg_actuation = EventTerm(
             func=randomize_peg_leg_actuation,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "prob_peg_leg": prob_peg_leg,
-                "target_leg": target_leg,
-                "prob_joint_disabled":  float(cfg["prob_joint_disabled"]),
                 "splint_length_range": splint_range,
                 "foot_friction_range": foot_friction_range,
 
                 "injured_splint_friction_only": injured_splint_friction_only,
 
-                # 부상 무릎 접기 각도 + 부목 부착 링크
-                "fold_knee_angle": float(cfg["fold_knee_angle"]),
+                 # 부상 calf 접힘각 정책 + 부목 부착 링크
+                "calf_random": calf_mode == "random",
+                "calf_fixed_angle": float(calf_policy_cfg["fixed"]["value"]),
+                "calf_min_fold": calf_min_fold,
+                "calf_max_fold": calf_max_fold,
+                "calf_padding": float(calf_random_cfg["padding"]),
                 "attach": attach,
 
                 "hip_torque_scale": hip_torque_scale,
@@ -989,9 +999,8 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 # 잠긴 calf 전용 PD (compliant 부목 무릎)
                 "splint_calf_stiffness": splint_calf_stiffness,
                 "splint_calf_damping": splint_calf_damping,
-
-                # 정상 보행을 할 환경 구성 갯수
-                "healthy_slots": healthy_slots,
+                "leg_deterministic": leg_deterministic,
+                "leg_ratios": leg_ratios,
             },
         )
 
@@ -1004,11 +1013,6 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
-        
-        # # ----- (B) Peg-leg 커리큘럼 -----
-        # 학습 초기: 10% 부상, 거의 정상 길이(0.30m)
-        # 학습 후기: 50% 부상, 짧은 부목(0.20m)
-        self._apply_curriculum_settings(cfg['curriculum'], steps_per_iteration, target_leg, healthy_slots)
         
     
     def apply_environment_settings(self, settings: dict, steps_per_iteration: int, eval_peg_leg:str =None):

@@ -5,23 +5,40 @@ train:
 
   num_envs: 2048
   max_iterations: 4000 # 8000, 500
+  normalize: false
+  mse_norm: 
+    enable: true
+
+    action_mean: 0.0
+    action_pstd: 0.0
+
+    splint_mean: 0.0
+    splint_std: 0.0
+
+    vel_mean: 0.0
+    vel_pstd: 0.0
+
   seed: 42
 
+  num_steps_per_env: 50
+  gradient_length: 50
+
+  splint_loss_coef: 1.0
+  vel_loss_coef: 1.0
+  
 checkpoint:
   mode: "distill" # warmstart, resume
   # Phase 2 teacher (부목 모델 v2)
-  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/phase2-antalgic-seed42/model_10998.pt
+  teacher: ""
   student: ""
   load_optimizer: false # false, true
   reset_iteration: true
-  
-env:
-  path: ../env/antalgic.yaml
-  overrides:
-    peg_leg:
-      curriculum:
-        enabled: false
+  reset_noise_std: false    # warmstart 시 init_noise_std 로 std 를 되돌린다
 
+
+env:
+  path: ../../env/antalgic.yaml
+ 
 eval:
   peg_leg: normal # normal, fl, fr, rl, rr
 
@@ -34,9 +51,7 @@ exploration:
       scalar:
         init_noise_std: 1.0
         min_action_std: 0.001
-        enforce_min_std: true
 
       log:
         init_noise_std: 0.05
         min_action_std: 0.001
-        enforce_min_std: true

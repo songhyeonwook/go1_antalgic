@@ -55,28 +55,20 @@ def mirror_action(action: torch.Tensor) -> torch.Tensor:
 #  관측 레이아웃
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
-# policy 그룹은 "고정 45차원 머리 + 선택적 꼬리" 구조다. 꼬리는 env YAML
-# 플래그로 켜지며 순서가 고정돼 있어, 총 차원만으로 구성을 역산할 수 있다.
+# policy 그룹은 고정 49차원이다 (선택적 꼬리 없음).
 #
 #   [0:3]   base_ang_vel        [3:6]   projected_gravity
 #   [6:9]   velocity_commands   [9:21]  joint_pos
-#   [21:33] joint_vel           [33:45] actions          ← 항상 존재
-#   [45:49] calf_pos_abs        use_calf_pos_nominal_rel  (선택)
-#   [49:51] rls_estimate        use_rls_estimate          (선택)
+#   [21:33] joint_vel           [33:45] actions
+#   [45:49] peg_leg one-hot     ← 정상 = [0,0,0,0]
 #
 # base_lin_vel 은 실기 Go1 에 없어 privileged 그룹으로 이동했다.
-POLICY_CORE_DIM = 45
-_TAIL_CALF = 4          # calf_pos_abs (FL, FR, RL, RR)
-_TAIL_RLS = 2           # rls_estimate [L̂_norm, √P_norm] — 미러 불변
-POLICY_DIMS = (
-    POLICY_CORE_DIM,                                # 45: 머리만
-    POLICY_CORE_DIM + _TAIL_CALF,                   # 49: + calf
-    POLICY_CORE_DIM + _TAIL_CALF + _TAIL_RLS,       # 51: + calf + rls
-)
+_ONEHOT_START = 45
+POLICY_CORE_DIM = 49    # 45 + peg_leg one-hot(4)
+POLICY_DIMS = (POLICY_CORE_DIM,)                    # 49
 
-# privileged 그룹: [FL, FR, RL, RR, injured_flag, L, (μ), lin_vel(3)]
-#   9  = 현재            10 = μ 제거 이전 덤프 (μ 는 미러 불변이라 통과)
-PRIVILEGED_DIMS = (9, 10)
+# privileged 그룹: [L(1), lin_vel(3)] = 4
+PRIVILEGED_DIMS = (4,)
 
 
 def mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -103,16 +95,14 @@ def mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     m[..., 21:33] = mirror_joint_tensor(obs[..., 21:33])  # joint_vel
     m[..., 33:45] = mirror_joint_tensor(obs[..., 33:45])  # actions
 
-    if dim >= POLICY_CORE_DIM + _TAIL_CALF:
-        # calf_pos_abs: calf 는 pitch 라 부호 유지, 좌우만 스왑
-        c = POLICY_CORE_DIM
-        m[..., c] = obs[..., c + 1]      # FL ↔ FR
-        m[..., c + 1] = obs[..., c]
-        m[..., c + 2] = obs[..., c + 3]  # RL ↔ RR
-        m[..., c + 3] = obs[..., c + 2]
-    # rls_estimate 는 스칼라 길이 추정 + 불확실도 → 미러 불변 (clone 그대로)
+    # peg_leg one-hot [45:49]: 좌우만 스왑, 부호 반전 없음.
+    # 정상 [0,0,0,0] 은 스왑해도 그대로라 별도 처리가 필요 없다.
+    c = _ONEHOT_START
+    m[..., c] = obs[..., c + 1]      # FL ↔ FR
+    m[..., c + 1] = obs[..., c]
+    m[..., c + 2] = obs[..., c + 3]  # RL ↔ RR
+    m[..., c + 3] = obs[..., c + 2]
     return m
-
 
 def mirror_privileged_obs(obs: torch.Tensor) -> torch.Tensor:
     """privileged 관측을 좌우 미러링합니다 (마지막 차원으로 레이아웃 판별).
@@ -127,12 +117,7 @@ def mirror_privileged_obs(obs: torch.Tensor) -> torch.Tensor:
         )
 
     m = obs.clone()
-    m[..., 0] = obs[..., 1]  # one-hot FL ↔ FR
-    m[..., 1] = obs[..., 0]
-    m[..., 2] = obs[..., 3]  # one-hot RL ↔ RR
-    m[..., 3] = obs[..., 2]
-    vy = dim - 2             # lin_vel = 마지막 3칸, 그 중 vy
-    m[..., vy] = -obs[..., vy]
+    m[..., 2] = -obs[..., 2]  # lin_vel 의 vy
     return m
 
 

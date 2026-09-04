@@ -1,0 +1,49 @@
+# Phase 2 스모크 테스트 전용 (warmstart 로드 / antalgic 환경 / injury 리워드 동작 확인).
+# 256 env, 100 iteration (2,400 step, 에피소드 20 s = 1,000 step 이라 env 당 2 에피소드 이상).
+# teacher 는 형상 확인용 phase-1 체크포인트 (actor 입력 53 = policy 49 + privileged 4).
+# injury 리워드의 ramp 를 0 으로 당겨 첫 스텝부터 완전 강도로 켠다 — 본 학습(ramp 41,000 step)
+# 에서는 2,400 step 동안 1% 도 안 켜져 리워드 크기를 볼 수 없기 때문. 그 외는 phase2_at 과 동일.
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase2_cfg_entry_point
+
+  num_envs: 256
+  max_iterations: 100
+  normalize: false
+  seed: 42
+
+  num_steps_per_env: 24
+
+checkpoint:
+  mode: "warmstart"
+  teacher: /home/robotserver/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_09_01_18_46_36_phase1_s42_P1-raw-001/model_4999.pt
+  student: ""
+  load_optimizer: false
+  reset_iteration: false
+  reset_noise_std: true
+
+env:
+  path: ../../env/antalgic.yaml
+  overrides:
+    reward:
+      injury:
+        injured_limb_force_nonuse:
+          ramp_start_steps: 0
+          ramp_duration_steps: 1
+        injured_limb_load_duty_nonuse:
+          ramp_duration_steps: 1
+
+eval:
+  peg_leg: normal
+
+exploration:
+  noise_std:
+    set: log
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+      log:
+        init_noise_std: 0.3
+        min_action_std: 0.001

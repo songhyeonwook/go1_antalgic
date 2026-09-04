@@ -515,6 +515,35 @@ def penalty_pain(
         )
     return penalty
 
+def _injured_ema(
+    env: "ManagerBasedRLEnv",
+    key: str,
+    value: torch.Tensor,
+    ema_alpha: float,
+    peg_leg_idx: torch.Tensor,
+) -> torch.Tensor:
+    """부상 다리 per-env EMA.
+
+    부상 다리 인덱스나 부목 길이 L 이 바뀐 env(= 방금 리셋된 env)만 현재값으로
+    되돌리고 나머지는 계속 누적한다. 상태는 env.<key>_ema / _idx / _L 에 보관.
+    """
+    alpha = float(max(0.0, min(0.9999, ema_alpha)))
+    splint_length = env._peg_leg_splint_length
+    ema = getattr(env, f"{key}_ema", None)
+    prev_idx = getattr(env, f"{key}_idx", None)
+    prev_L = getattr(env, f"{key}_L", None)
+
+    if ema is None or prev_idx is None or prev_L is None:
+        ema = value.detach().clone()
+    else:
+        changed = (prev_idx != peg_leg_idx) | ((prev_L - splint_length).abs() > 1e-4)
+        ema[changed] = value.detach()[changed]
+        ema.mul_(alpha).add_(value.detach(), alpha=1.0 - alpha)
+
+    setattr(env, f"{key}_ema", ema)
+    setattr(env, f"{key}_idx", peg_leg_idx.detach().clone())
+    setattr(env, f"{key}_L", splint_length.detach().clone())
+    return ema
 
 def _splint_severity_alpha(
     env: "ManagerBasedRLEnv",
@@ -542,28 +571,20 @@ def penalize_injured_limb_force_nonuse(
     sensor_name: str = "contact_forces",
     use_z_only: bool = True,
     ema_alpha: float = 0.995,
-    severe_splint_length: float = 0.20,
-    mild_splint_length: float = 0.30,
-    min_force_severe: float = 2.0,
-    min_force_mild: float = 11.0,
+    force_dynamics: bool = False,
+    force_fixed: float = 5.0,
+    short_splint_length: float = 0.33,
+    short_splint_force: float = 6.0,
+    long_splint_length: float = 0.45,
+    long_splint_force: float = 4.0,
     front_leg_multiplier: float = 1.15,
     rear_leg_multiplier: float = 1.0,
     ramp_start_steps: int = 1000,
     ramp_duration_steps: int = 8000,
-    include_calf: bool = True,
 ) -> torch.Tensor:
  
     contact_by_leg = _splint_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-    if include_calf:
-        contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-        calf_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
-        contact_by_calf, _ = _link_force_tensor(
-            env,
-            sensor_name=sensor_name,
-            link_name_candidates=calf_names,
-            use_z_only=use_z_only,
-        )
-        contact_by_leg = contact_by_leg + contact_by_foot + contact_by_calf
+    
     peg_leg_idx = _peg_leg_index_per_env(env)
 
     injured_force = torch.zeros(env.num_envs, device=env.device)
@@ -572,38 +593,21 @@ def penalize_injured_limb_force_nonuse(
         if mask.any():
             injured_force[mask] = contact_by_leg[mask, leg]
 
-    alpha = float(max(0.0, min(0.9999, ema_alpha)))
-    ema = getattr(env, "_go1_injured_force_ema", None)
-    prev_idx = getattr(env, "_go1_injured_force_ema_idx", None)
-    prev_splint = getattr(env, "_go1_injured_force_ema_splint", None)
-    splint_length = getattr(env, "_peg_leg_splint_length", None)
-    if ema is None or ema.shape != injured_force.shape:
-        ema = injured_force.detach().clone()
-    else:
-        changed = prev_idx is None or prev_idx.shape != peg_leg_idx.shape
-        if changed:
-            changed_mask = torch.ones_like(peg_leg_idx, dtype=torch.bool)
-        else:
-            changed_mask = prev_idx.to(env.device) != peg_leg_idx
-            if splint_length is not None:
-                if prev_splint is None or prev_splint.shape != splint_length.shape:
-                    changed_mask = torch.ones_like(changed_mask, dtype=torch.bool)
-                else:
-                    changed_mask = changed_mask | (
-                        torch.abs(prev_splint.to(env.device) - splint_length.to(env.device)) > 1e-4
-                    )
-        if changed_mask.any():
-            ema[changed_mask] = injured_force.detach()[changed_mask]
-        ema.mul_(alpha).add_(injured_force.detach(), alpha=1.0 - alpha)
-    env._go1_injured_force_ema = ema
-    env._go1_injured_force_ema_idx = peg_leg_idx.detach().clone()
-    if splint_length is not None:
-        env._go1_injured_force_ema_splint = splint_length.detach().clone()
+    ema = _injured_ema(env, "_go1_injured_force", injured_force, ema_alpha, peg_leg_idx)
 
-    severity_alpha = _splint_severity_alpha(env, severe_splint_length, mild_splint_length)
-    target = float(min_force_severe) + (
-        float(min_force_mild) - float(min_force_severe)
-    ) * severity_alpha
+    if force_dynamics:
+        # 부목 길이 L 을 short_splint_length(=0) ~ long_splint_length(=1) 로
+        # 정규화한 뒤, 두 최소 하중 사이를 그 비율로 섞는다.
+        length_alpha = _splint_severity_alpha(
+            env, short_splint_length, long_splint_length
+        )
+        target = float(short_splint_force) + (
+            float(long_splint_force) - float(short_splint_force)
+        ) * length_alpha
+    else:
+        # 부목 길이와 무관하게 yaml 의 고정값을 모든 env 에 똑같이 채운다.
+        target = torch.full((env.num_envs,), float(force_fixed), device=env.device)
+
     front_mask = (peg_leg_idx == 0) | (peg_leg_idx == 1)
     target = torch.where(
         front_mask,
@@ -623,10 +627,14 @@ def penalize_injured_limb_load_duty_nonuse(
     load_contact_threshold: float = 10.0,
     use_z_only: bool = True,
     ema_alpha: float = 0.995,
-    severe_splint_length: float = 0.20,
-    mild_splint_length: float = 0.30,
-    min_duty_severe: float = 0.05,
-    min_duty_mild: float = 0.28,
+    
+    duty_dynamics: bool = False,            
+    duty_fixed: float = 0.34,               
+    short_splint_length: float = 0.33,      
+    short_splint_duty: float = 0.40,        
+    long_splint_length: float = 0.45,       
+    long_splint_duty: float = 0.28,         
+
     front_leg_multiplier: float = 1.10,
     rear_leg_multiplier: float = 1.0,
     ramp_start_steps: int = 1000,
@@ -650,45 +658,31 @@ def penalize_injured_limb_load_duty_nonuse(
             injured_contact[mask] = (
                 contact_by_splint[mask, leg] > float(load_contact_threshold)
             ).float()
+            
+    ema = _injured_ema(env, "_go1_injured_load_duty", injured_contact, ema_alpha, peg_leg_idx)
+    
 
-    alpha = float(max(0.0, min(0.9999, ema_alpha)))
-    ema = getattr(env, "_go1_injured_load_duty_ema", None)
-    prev_idx = getattr(env, "_go1_injured_load_duty_ema_idx", None)
-    prev_splint = getattr(env, "_go1_injured_load_duty_ema_splint", None)
-    splint_length = getattr(env, "_peg_leg_splint_length", None)
-    if ema is None or ema.shape != injured_contact.shape:
-        ema = injured_contact.detach().clone()
+    if duty_dynamics:
+        # 부목 길이 L 을 short_splint_length(=0) ~ long_splint_length(=1) 로
+        # 정규화한 뒤, 두 duty 사이를 그 비율로 섞는다.
+        # env 마다 L 이 다르므로 결과는 env 개수만큼의 벡터가 된다.
+        length_alpha = _splint_severity_alpha(
+            env, short_splint_length, long_splint_length
+        )
+        target = float(short_splint_duty) + (
+            float(long_splint_duty) - float(short_splint_duty)
+        ) * length_alpha
     else:
-        changed = prev_idx is None or prev_idx.shape != peg_leg_idx.shape
-        if changed:
-            changed_mask = torch.ones_like(peg_leg_idx, dtype=torch.bool)
-        else:
-            changed_mask = prev_idx.to(env.device) != peg_leg_idx
-            if splint_length is not None:
-                if prev_splint is None or prev_splint.shape != splint_length.shape:
-                    changed_mask = torch.ones_like(changed_mask, dtype=torch.bool)
-                else:
-                    changed_mask = changed_mask | (
-                        torch.abs(prev_splint.to(env.device) - splint_length.to(env.device)) > 1e-4
-                    )
-        if changed_mask.any():
-            ema[changed_mask] = injured_contact.detach()[changed_mask]
-        ema.mul_(alpha).add_(injured_contact.detach(), alpha=1.0 - alpha)
-    env._go1_injured_load_duty_ema = ema
-    env._go1_injured_load_duty_ema_idx = peg_leg_idx.detach().clone()
-    if splint_length is not None:
-        env._go1_injured_load_duty_ema_splint = splint_length.detach().clone()
+        # 부목 길이와 무관하게 yaml 의 고정값을 모든 env 에 똑같이 채운다.
+        target = torch.full((env.num_envs,), float(duty_fixed), device=env.device)
 
-    severity_alpha = _splint_severity_alpha(env, severe_splint_length, mild_splint_length)
-    target = float(min_duty_severe) + (
-        float(min_duty_mild) - float(min_duty_severe)
-    ) * severity_alpha
+
     front_mask = (peg_leg_idx == 0) | (peg_leg_idx == 1)
     target = torch.where(
         front_mask,
         torch.clamp(target * float(front_leg_multiplier), max=0.5),
         torch.clamp(target * float(rear_leg_multiplier), max=0.5),
-    )
+    )        
 
     is_injured = peg_leg_idx >= 0
     penalty = torch.zeros(env.num_envs, device=env.device)

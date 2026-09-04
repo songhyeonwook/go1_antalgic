@@ -8,40 +8,15 @@ peg_leg:
 
   # Phase 1도 부목 asset 자체는 동일하게 사용 (presence 전부-없음, 차원 일치용)
   attach: thigh
-  fold_knee_angle: -2.55
 
   # Phase 1은 모든 환경을 정상 상태로 유지
   prob_peg_leg: 0.0 # 부상을 적용할 확률
   target_leg: env_fixed # 부상이 적용되었다면 어느 다리를 선택할지 결정
 
-  # 부상이 선택됐을 때 적용할 설정
-  prob_joint_disabled: 1.0 # 부상 다리가 선택됐을 때 해당 다리의 calf 관절을 실제로 고정할 확률
-
   injured_splint_friction_only: true
-
+  # 기존: 0.33 ~ 0.45
   splint_length_range: [0.33, 0.45] # 부목 길이 균등분포 파라미터
   foot_friction_range: [0.5, 1.5] # 부목 끝단에 사용할 마찰계수 샘플 범위
-
-  curriculum:
-    enabled: true
-
-    # 부상 다리 확률
-    leg_probability:
-      initial: 0.1
-      final: 0.5
-      iterations: 5000 # 증가 함수
-
-    # 부목 길이 범위 램프
-    splint_length:
-      # 초기 부목범위 (쉬움)
-      initial_min: 0.33
-      initial_max: 0.36
-
-      # 후기학습시 부목 범위 (전체)
-      final_min: 0.33
-      final_max: 0.45
-
-      iterations: 8000
 
 # 로봇 Actuator 설정
 actuator:
@@ -83,29 +58,13 @@ command:
     min: 0.10                     # 전진 최소 속도 [m/s]
     max: 1.0                    # 전진 최대 속도 [m/s]
 
-  linear_velocity_y_abs: 0.0      # 좌우 속도 범위 [-값, +값]
-  angular_velocity_yaw_abs: 0.15  # 회전 속도 범위 [-값, +값]
+  linear_velocity_y_abs: 0.3      # 좌우 속도 범위 [-값, +값]
+  angular_velocity_yaw_abs: 0.4  # 회전 속도 범위 [-값, +값]
 
 
 # Observation 설정
 observation:
-  history_length: 1              # 현재 observation만 사용
   use_height_scan: false         # proprioception_only였는데 이름 변경 자기 상태 정보만 사용
-
-  use_calf_pos_nominal_rel: false
-
-  # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] (Phase 2/3와 차원 일치용)
-  use_rls_estimate: false
-
-  # live RLS 파라미터 (healthy 는 부상 env 가 없어 항상 prior 에 머무름 —
-  # antalgic.yaml 과 동일 구조 유지용)
-  rls:
-    torque_gate_nm: 3.2
-    foot_stance_n: 20.0
-    update_stride: 3
-    meas_noise_std: 0.005
-    innovation_gate_m: 0.08
-    min_axis_coef: 0.3
 
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
@@ -142,10 +101,7 @@ domain_randomization:
     joint_vel_std: 0.02
     base_ang_vel_std: 0.05
     projected_gravity_std: 0.05
-    base_lin_vel_std: 0.05
-    # antalgic.yaml 과 동일 — healthy 는 항상 prior 라 사실상 상수에 노이즈
-    rls_estimate_std: 0.05
-
+  
 # 전방 Payload 및 CoM 설정 OK
 payload:
   enabled: false
@@ -173,7 +129,7 @@ reward:
   energy:    
     # 이미 Isaac Lab에 존재하는 페널티의 가중치를 배율로 조정
     # ex # Isaac Lab 기본 -0.0002 × 30 = 실제 최종 -0.006
-    torque_penalty_scale: 30 # 관절 토크가 클수록 페널티가 커짐
+    torque_penalty_scale: 20 # 관절 토크가 클수록 페널티가 커짐
 
     # Isaac Lab 기본 -2.5e-7 × 0.5 = 실제 최종 -1.25e-7
     dof_acc_penalty_scale: 0.5 # 관절 가속도 페널티
@@ -184,8 +140,10 @@ reward:
   posture:
     flat_orientation_weight: -2.0 # 몸통이 수평에서 벗어나는 것을 벌점
     base_height_target: 0.27 # 로봇 몸통이 유지해야 할 목표 높이 (목표값임 보상아님)
+    # base_height_weight: -40 # -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
     base_height_weight: -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
 
+  # TODO: 동작여부확인
   calf_contact:
     enabled: false
 
@@ -194,36 +152,12 @@ reward:
     enabled: true
     weight: 1.0 # 로봇이 종료되지 않고 한 step을 버틸 때마다 주는 생존 보상
 
-
   joint_mirror_symmetry:
     enabled: false
     weight: -2.0
+
   symmetric: # 네 다리를 균형 있게 사용하도록 유도하는 보상 모음
     enabled: false
-
-    contact_force_asymmetry: # 패널티에 해당함으로
-      weight: 0.0 # 음수로 줘야함
-      ramp_duration_steps: 6000
-
-    duty_factor_asymmetry:
-      weight: 0.0
-      contact_threshold: 1.0
-      ramp_duration_steps: 6000
-
-    diagonal_load_asymmetry:
-      weight: 0.0
-      ramp_duration_steps: 6000
-
-    front_rear_load_distribution:
-      weight: 0.0
-      target_front_fraction: 0.55
-      tolerance: 0.06
-      ramp_duration_steps: 6000
-
-    trot_synchronization:
-      weight: 0.0
-      ramp_duration_steps: 6000
-  
 
   # Phase 1은 부상 리워드 미사용 (활성 키 구조는 antalgic.yaml 참고)
   injury:

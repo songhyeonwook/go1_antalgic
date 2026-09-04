@@ -14,10 +14,15 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
 )
 
-from go1_lab.tasks.manager_based.go1_lab.mdp import aux_distillation  # noqa: F401  registers StudentTeacherRecurrentAux / DistillationAux
-from go1_lab.tasks.manager_based.go1_lab.mdp.rls import RLS_L_PRIOR, RLS_L_SCALE
+"""
+RslRlOnPolicyRunnerCfg              RslRlDistillationRunnerCfg
+        │                                      │
+   BaseRunnerCfg                        Phase3DistillationRunnerCfg
+    ├── Phase1HealthyRunnerCfg              (phase 3)
+    └── Phase2InjuryRunnerCfg
 
 
+"""
 @configclass
 class BaseRunnerCfg(RslRlOnPolicyRunnerCfg):
     # Phase 1과 Phase 2에서 공통으로 사용하는 Runner 설정
@@ -30,26 +35,7 @@ class BaseRunnerCfg(RslRlOnPolicyRunnerCfg):
         "critic": ["policy", "privileged_obs"],
     }
 
-    """
-    example..
-    policy observation
-        - 관절 위치
-        - 관절 속도
-        - 몸체 각속도
-        - 중력 방향
-        - 이전 action
-
-    privileged observation
-    [
-        FL 부상 여부,
-        FR 부상 여부,
-        RL 부상 여부,
-        RR 부상 여부,
-        전체 부상 플래그,
-        부목 길이,
-        발 마찰계수
-    ]
-    """
+    # Actor 그조
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         #noise_std_type="scalar",
@@ -91,80 +77,65 @@ class Phase2InjuryRunnerCfg(BaseRunnerCfg):
     run_name = "phase2"
 
 
-# =====================================================================
-# Phase 3: Student Distillation (Teacher latent 모사)
-# =====================================================================
+"""
+agent_cfg.class_name
+        ↓
+resolve_runner_class(...)
+        ↓
+어떤 Runner 클래스를 만들지 결정
+        ↓
+Phase3DistillationRunner 생성
+        ↓
+Phase3DistillationRunner._construct_algorithm()
+        ↓
+Phase3StudentTeacher + Phase3Distillation 생성
+"""
+# 기본 StudentTeacherRecurrent 말고, Phase3StudentTeacher 클래스를 사용
+@configclass
+class Phase3StudentTeacherCfg(RslRlDistillationStudentTeacherRecurrentCfg):
+    class_name: str = "Phase3StudentTeacher"
+    # 출력 정규화 (yaml train.mse_norm). train.py 의 update_agent_cfg 가 덮어쓴다.
+    # mse_norm_enable=False 면 아래 값은 무시되고 정책 buffer 는 항등 (mean 0, std 1) 이 된다.
+    mse_norm_enable: bool = False
+    action_mean: float | list[float] = 0.0   # 12 관절 또는 스칼라
+    action_pstd: float = 1.0
+    splint_mean: float = 0.0
+    splint_std: float = 1.0
+    vel_mean: float | list[float] = 0.0      # 3 축 또는 스칼라
+    vel_pstd: float = 1.0
 
 @configclass
-class StudentTeacherRecurrentAuxCfg(RslRlDistillationStudentTeacherRecurrentCfg):
-    class_name: str = "StudentTeacherRecurrentAux"
-    aux_num_targets: int = 1
-    # 부상 다리 분류 헤드: [FL, FR, RL, RR, 정상] 5-way (0 이면 헤드 미생성)
-    aux_num_classes: int = 5
-
-
-@configclass
-class DistillationAuxCfg(RslRlDistillationAlgorithmCfg):
-    """Distillation + 보조 지도 손실 (L 회귀 + 부상 다리 5-way 분류).
-
-    aux_targets 의 shift/scale 은 관측 정규화와 동일 규약:
-      L: (L − RLS_L_PRIOR) / RLS_L_SCALE  (rls_estimate 채널과 일치)
-    """
-
-    class_name: str = "DistillationAux"
-    aux_loss_coef: float = 0.5
-    aux_cls_loss_coef: float = 0.5
-    # privileged_obs = [FL, FR, RL, RR, injured_flag, L, lin_vel(3)]
-    aux_mask: dict = {"group": "privileged_obs", "index": 4}
-    aux_targets: list = [
-        {"name": "splint_length", "group": "privileged_obs", "index": 5,
-         "shift": RLS_L_PRIOR, "scale": RLS_L_SCALE},
-    ]
-    # 부상 다리 분류: one-hot[0:4] 이 다리, [4] 가 injured_flag.
-    # masked=False → 정상 env 를 normal_class 로 두고 전 env 학습 (5-way).
-    # masked=True  → 부상 env 한정 4-way (그 경우 aux_num_classes=4 로).
-    aux_cls: dict = {
-        "group": "privileged_obs", "leg_start": 0, "num_legs": 4,
-        "flag_index": 4, "normal_class": 4, "masked": False,
-    }
-
+class Phase3DistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
+    class_name: str = "Phase3Distillation"
+    splint_loss_coef: float = 0.5
+    vel_loss_coef: float = 1.0
+    # train.py 가 env yaml 의 peg_leg.splint_length_range 로 덮어쓴다. 여기 값은 기본값일 뿐.
+    splint_length_range: tuple[float, float] = (0.33, 0.45)
 
 @configclass
-class DistillRunnerCfg(RslRlDistillationRunnerCfg):
-    """Phase 3: Student distillation.
-
-    Teacher(Phase 2)를 동결하고 Student LSTM이
-    proprioceptive history만으로 Teacher의 latent z_t를 추정합니다.
-
-    loss: ||z_t - z_hat_t||² (MSE)
-    """
-
-    num_steps_per_env = 32
-    max_iterations = 12000
-    save_interval = 100
-    experiment_name = "unitree_go1_rough_student"
+class Phase3DistillationRunnerCfg(RslRlDistillationRunnerCfg):
+    # BaseRunnerCfg 를 상속하지 말 것. obs_groups 에 critic 이 섞이고
+    # policy 에 privileged_obs 가 들어가 student 가 53차원을 보게 된다.
+    class_name = "Phase3DistillationRunner"
+    num_steps_per_env = 50
+    save_interval = 50
+    max_iterations = 4000            # yaml train.max_iterations 가 덮어씀
+    experiment_name = "unitree_go1_phase3"
+    run_name = "phase3"
     check_for_nan = True
 
     obs_groups = {
-        "policy": ["policy"],
-        "teacher": ["policy", "privileged_obs"],
+        "policy": ["policy"],                       # student 49
+        "teacher": ["policy", "privileged_obs"],    # teacher 53
     }
-    
-    """
-    obs_groups = {
-        "policy": ["policy"],
-        "teacher": ["policy", "privileged_obs"],
-    }
-    
-    """
 
-    policy = StudentTeacherRecurrentAuxCfg(
+    policy = Phase3StudentTeacherCfg(
         init_noise_std=0.05,
-        noise_std_type="log",
+        noise_std_type="log",        # Isaac Lab 기본은 "scalar". yaml 의 set: log 와 반드시 일치
         student_obs_normalization=False,
         teacher_obs_normalization=False,
-        student_hidden_dims=[512, 256, 128],
-        teacher_hidden_dims=[512, 256, 128],
+        student_hidden_dims=[512, 256, 128],   # 256 -> 512 -> 256 -> 128 -> 12
+        teacher_hidden_dims=[512, 256, 128],   # Phase-2 actor 와 동일해야 로드됨
         activation="elu",
         rnn_type="lstm",
         rnn_hidden_dim=256,
@@ -172,11 +143,10 @@ class DistillRunnerCfg(RslRlDistillationRunnerCfg):
         teacher_recurrent=False,
     )
 
-    algorithm = DistillationAuxCfg(
+    algorithm = Phase3DistillationAlgorithmCfg(
         num_learning_epochs=5,
         learning_rate=5.0e-4,
-        gradient_length=32,
+        gradient_length=50, # 50-step          
         max_grad_norm=1.0,
-        optimizer="adam",
         loss_type="mse",
     )

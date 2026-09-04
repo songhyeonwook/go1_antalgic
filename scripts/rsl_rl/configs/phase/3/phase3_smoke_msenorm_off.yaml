@@ -1,0 +1,51 @@
+# [Claude 검증용] mse_norm 동작 확인 스모크 (enable: false). 64 env, 50 iteration, teacher = P2-AT-001 최종 checkpoint.
+# on/off 두 파일은 mse_norm.enable 만 다르다. 확인이 끝나면 지워도 된다.
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase3_cfg_entry_point
+
+  num_envs: 64
+  max_iterations: 50
+  normalize: false
+  seed: 42
+
+  num_steps_per_env: 50
+  gradient_length: 50
+  splint_loss_coef: 0.5
+  vel_loss_coef: 0.5
+
+  # P2-AT-001 obs_debug 에서 compute_output_norm.py 로 생성한 값 (mse_norm.yaml)
+  mse_norm:
+    enable: false
+    action_mean: [-0.931, 0.916, -1.572, 1.237, -0.898, -0.849, -1.227, -1.192, 2.664, 2.641, 2.362, 2.347]
+    action_pstd: 0.6259
+    splint_mean: 0.3900
+    splint_std: 0.0343
+    vel_mean: [0.5167, 0.0008, -0.0016]
+    vel_pstd: 0.1825
+
+checkpoint:
+  mode: "distill"
+  teacher: /home/robotserver/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_09_03_19_47_35_phase2_s42_P2-AT-001/model_10998.pt
+  student: ""
+  load_optimizer: false
+  reset_iteration: true
+  reset_noise_std: false
+
+env:
+  path: ../../env/antalgic.yaml
+
+eval:
+  peg_leg: normal
+
+exploration:
+  noise_std:
+    set: log
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+      log:
+        init_noise_std: 0.05
+        min_action_std: 0.001

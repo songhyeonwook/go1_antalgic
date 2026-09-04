@@ -8,23 +8,46 @@ peg_leg:
   # 부목 부착 링크: thigh(무릎 고정 다리보조기, 전후 스윙 가능) | hip(강체 지팡이)
   attach: thigh
   # 부상 무릎을 접어 발을 들어올리는 각도 [rad]
-  fold_knee_angle: -2.55
+  leg_policy:
+    mode: env_fixed
 
-  prob_peg_leg: 0.5 # 부상을 적용할 확률
-  # target_leg 가 env fixed인 경우 prob_peg_leg를 적용하지 않음
-  # 부상이 적용되었다면 환경번호에 따라 정상, 부상 다리를 역할을 고정적으로 결정함
-  # (env_fixed 는 부목 presence 토글이 첫 리셋 이후 발생하지 않아 학습 비용도 0)
-  target_leg: 'env_fixed'
-  env_fixed_healthy_slots: 4 # 정상다리 갯수
+    # 전체 환경에서 각 상태가 차지할 비율
+    env_fixed:
+      normal: 0.5
+      fl: 0.125
+      fr: 0.125
+      rr: 0.125
+      rl: 0.125
+    
+    # reset마다 확률적으로 상태를 뽑는 방식
+    random:
+      # reset 시 각 상태가 선택될 확률
+      normal: 0.50
+      fl:     0.125
+      fr:     0.125
+      rl:     0.125
+      rr:     0.125
 
   # 부상이 선택됐을 때 적용할 설정
-  prob_joint_disabled: 1.0 # 부상 다리가 선택됐을 때 해당 다리의 calf 관절을 실제로 고정할 확률
+  calf_policy:
+    mode: fixed
+
+    fixed:
+      value: -2.55
+    
+    random:
+      # 하한: 최대로 접는 각. Go1 URDF 하드 한계 -2.818 에서 여유를 둔 값
+      min_fold: -2.55
+      # 상한 물리 한계: 최대로 펴는 각 (URDF upper)
+      max_fold: -1.0 
+      # 발끝이 부목 끝단보다 이만큼 위에 오도록 [m]
+      padding: 0.02 
 
   # true: 부상 다리의 부목 끝단 shape에만 샘플 마찰 적용
-  # false: 부상 환경의 로봇 전체 shape에 적용 (비권장)
   injured_splint_friction_only: true
 
   # curriculum이 꺼져있는 경우 아래 범위로 사용.
+  # splint_length_range: [0.26, 0.36] 
   splint_length_range: [0.33, 0.45] # 부목 길이 균등분포 파라미터
   foot_friction_range: [0.5, 1.5] # 부목 끝단에 사용할 마찰계수 샘플 범위
 
@@ -38,27 +61,6 @@ peg_leg:
     stiffness: 100.0
     damping: 1.0
 
-  curriculum:
-    enabled: true
-
-    # 부상 다리 확률
-    leg_probability:
-      initial: 0.1
-      final: 0.5
-      iterations: 4500 # 증가 함수
-
-    # 부목 길이 범위 램프: 짧은 부목(≈nominal leg reach, 쉬움)에서 시작해
-    # 긴 부목(키다리, 비대칭 큼)까지 확장
-    splint_length:
-      # 초기 부목범위 (쉬움)
-      initial_min: 0.33
-      initial_max: 0.36
-
-      # 후기학습시 부목 범위 (전체)
-      final_min: 0.33
-      final_max: 0.45
-
-      iterations: 6000
     
 # 로봇 Actuator 설정 OK
 actuator:
@@ -109,20 +111,6 @@ observation:
   history_length: 1              # 현재 observation만 사용
   use_height_scan: false         # proprioception_only였는데 이름 변경 자기 상태 정보만 사용
 
-  use_calf_pos_nominal_rel: false
-
-  # RLS 부목 길이 추정 채널 [L̂_norm, √P_norm] 을 policy 관측에 추가
-  use_rls_estimate: false
-
-  # live RLS 갱신 파라미터 (mdp/rls.py — 착지 등식 + 토크 게이트).
-  rls:
-    torque_gate_nm: 3.2      # 부목 접지 판정 √(τ_hip²+τ_thigh²) [N·m]
-    foot_stance_n: 20.0      # 기준 발 스탠스 판정 접촉력 [N]
-    update_stride: 3         # episode step 서브샘플 주기 (상관 노이즈 완화)
-    meas_noise_std: 0.005    # 측정 노이즈 표준편차 [m]
-    innovation_gate_m: 0.08  # innovation 기각 임계 [m]
-    min_axis_coef: 0.3       # ĝ·b 최소값 (부목 축이 수평이면 정보 없음)
-
   # Phase 1에서도 Phase 2와 입력 차원을 맞추기 위해
   # privileged observation group 자체는 유지
   privileged:
@@ -157,8 +145,6 @@ domain_randomization:
     joint_vel_std: 0.02
     base_ang_vel_std: 0.05
     projected_gravity_std: 0.05
-    base_lin_vel_std: 0.05
-    rls_estimate_std: 0.05
 
 # 전방 Payload 및 CoM 설정 OK
 payload:
@@ -179,35 +165,36 @@ reward:
     # GO1_FEET_AIR_TIME_WEIGHT
     feet_air_time_weight: 0.3 # 발이 지면에서 떨어져 공중에 머무르는 시간을 보상 # 0.25 -> 0.5
 
-    # 적용 전 값. 이후 action_rate_penalty_scale=0.5가 곱해져 실제 최종 weight는 -0.025가 됨
+    # 적용 전 값. 이후 action_rate_penalty_scale=0.5가 곱해져 실제 최종 weight는 -0.05 가 됨
     action_rate_weight: -0.1 # 연속된 두 시점의 action 변화량을 벌점
     angular_velocity_xy_weight: -0.1 # 몸통의 roll축과 pitch축 각속도를 억제하기 위한 벌점
 
   energy:
     # 이미 Isaac Lab에 존재하는 페널티의 가중치를 배율로 조정
-    # ex # Isaac Lab 기본 -0.0002 × 30 = 실제 최종 -0.006
+    # ex # Isaac Lab go1 기본 -0.0002 × 20 = 실제 최종 -0.004
     torque_penalty_scale: 20 # 관절 토크가 클수록 페널티가 커짐
 
     # Isaac Lab 기본 -2.5e-7 × 0.5 = 실제 최종 -1.25e-7
     dof_acc_penalty_scale: 0.5 # 관절 가속도 페널티
 
-    # gait_tuning의 -0.05 × 0.5 = 실제 최종 -0.025
+    # gait_tuning의 -0.1 × 0.5 = 실제 최종 -0.05
     action_rate_penalty_scale: 0.5 # final action rate weight = action_rate_weight *action_rate_penalty_scale 
 
   posture:
     flat_orientation_weight: -2.0 # 몸통이 수평에서 벗어나는 것을 벌점
     base_height_target: 0.27 # 로봇 몸통이 유지해야 할 목표 높이 (목표값임 보상아님)
+    # base_height_weight: -40 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
     base_height_weight: -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
   
-  # 정상 calf가 바닥을 짚는 무릎/정강이 보행 방지
+  # 정상이든 부상다리든 calf가 바닥을 짚는 무릎/정강이 보행 방지
   calf_contact:
-    enabled: false
+    enabled: true
 
     # 함수 출력이 접촉력 N 단위이므로 작은 값부터 시작
     weight: -0.01
 
     # 이 힘 이하의 calf 접촉은 무시
-    force_threshold: 5.0
+    force_threshold: 0
 
     # calf 하나당 raw penalty 상한
     max_overload: 100.0
@@ -280,12 +267,6 @@ reward:
       enabled: true
       weight: -1.0
 
-      # true 면 발+calf 접촉력도 하중에 합산 (구모델 호환).
-      include_calf: false
-
-      min_force_severe: 5.0
-      min_force_mild: 5.0
-
       # 앞다리는 구조적으로 조금 더 높은 최소 하중 적용
       front_leg_multiplier: 1.15
       rear_leg_multiplier: 1.0
@@ -297,16 +278,44 @@ reward:
       ramp_start_steps: 1000
       ramp_duration_steps: 40000
 
+      # splint_length_range: [0.27, 0.37] # 부목 길이 균등분포 파라미터
+      force_policy:
+        mode: fixed
+        
+        fixed:
+          value: 5.0
+
+        # 0.33 m 이하에서는 최소 요구 접촉력을 6 N으로 고정하고, 0.33~0.45 m 구간에서는 부목 길이가 길어질수록 6 N에서 4 N까지 선형적으로 감소시키며, 0.45 m 이상에서는 4 N으로 고정하는 방식
+        dynamics:
+          short_splint_length: 0.27
+          short_splint_force: 6.0   # 짧은 부목에 요구할 최소 하중 [N]
+
+          long_splint_length: 0.37
+          long_splint_force: 4.0    # 긴 부목에 요구할 최소 하중 [N]
+      
+
     injured_limb_load_duty_nonuse:  # 부상 다리의 유효 하중 시간이 너무 낮은 경우
       enabled: true
       weight: -1.5
-      load_contact_threshold: 10.0
-      min_duty_severe: 0.28
-      min_duty_mild: 0.4
-      front_leg_multiplier: 1.1
-      rear_leg_multiplier: 1.0
+
+      load_contact_threshold: 10.0 # 접지 판정 기준 [N]      
+      front_leg_multiplier: 1.1 # 앞 다리가 더 하중을 지지하기 때문에 duty fixed * 1.1
+      rear_leg_multiplier: 1.0 # 뒷 다리의 경우 duty fixed와 동일
       ema_alpha: 0.97
       ramp_duration_steps: 40000
+
+      duty_policy:
+        mode: fixed
+
+        fixed:
+          value: 0.34 # 목표 duty
+
+        dynamics:          
+          short_splint_length: 0.27
+          short_splint_duty: 0.40   # 짧은 부목에 요구할 duty
+
+          long_splint_length: 0.37
+          long_splint_duty: 0.28    # 긴 부목에 요구할 duty
 
 # 종료 조건
 termination:

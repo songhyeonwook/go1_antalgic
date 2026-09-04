@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -14,7 +13,6 @@ from isaaclab.managers import SceneEntityCfg
 
 from go1_lab.splint import LEGS, SPLINT_MAX, SPLINT_MIN, set_splint_presence
 
-from .rls import reset_rls
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -125,12 +123,13 @@ def apply_peg_leg_calf_stiffness(
     stiffness: float | None,
     damping: float,
 ) -> None:
-    """잠긴 무릎(calf)을 유한 강성 스프링으로 만든다 (리셋 시).
+    """
+    잠긴 무릎(calf)을 유한 강성 스프링으로 만든다 (리셋 시).
 
-    실제 부목은 하중에 약간 휘어 충격을 흡수한다. 무한히 단단한 무릎은 적재 충격이
-    몸통 붕괴로 이어지므로, 부상 calf 의 PD 게인을 낮춰 compliant 하게 만든다.
-    healthy / 잠기지 않은 다리는 nominal 게인을 유지한다. Go1 관절 순서는 per-TYPE
-    이므로 반드시 이름으로 리졸브한다.
+    부목으로 고정된 무릎이므로 정상 관절(Kp=20, 정책이 제어)보다 높은 게인을 준다
+    — 접촉 충격에 fold 각이 밀리지 않아야 한다. 다만 kinematic weld 처럼 무한히
+    단단하게 만들지는 않는다: 유한 강성이라 적재 충격을 일부 흡수해 몸통 붕괴를 막는다.
+    healthy / 잠기지 않은 다리는 nominal 게인을 유지한다.
     """
     if stiffness is None:
         return
@@ -202,7 +201,6 @@ def _ensure_peg_leg_buffers(env: "ManagerBasedRLEnv") -> None:
             (env.num_envs,), -1, device=env.device, dtype=torch.long
         )
     if not hasattr(env, "_peg_leg_lock_active"):
-        # 부상 다리의 calf 가 실제로 잠겼는지 (prob_joint_disabled 반영)
         env._peg_leg_lock_active = torch.zeros(
             (env.num_envs,), device=env.device, dtype=torch.bool
         )
@@ -290,99 +288,81 @@ def _ensure_calf_action_ids(env: "ManagerBasedRLEnv", robot: Articulation) -> No
     env._calf_action_ids = ids
 
 
-# 내부 인덱스: 0=FL, 1=FR, 2=RL, 3=RR (정상 = -1).
-# privileged obs 로는 peg_leg_one_hot 이 [FL,FR,RL,RR,injured_flag] 5차원으로 노출합니다.
-_TARGET_LEG_MAP: dict[str, int] = {"fl": 0, "fr": 1, "rl": 2, "rr": 3}
-
-
-# 각 환경에 어느 다리가 부상인지 결정해서 다리 인덱스를 반환하는 함수
-def _sample_peg_leg_indices(
+def _assign_leg_by_ratio(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
-    prob_peg_leg: float,
-    target_leg: str = "random",
-    healthy_slots: int = 4,
+    leg_ratios,
+    deterministic: bool,
 ) -> torch.Tensor:
-    """각 환경마다 고장 다리 인덱스를 샘플링합니다. 정상은 -1.
+    """비율에 따라 [Normal, FL, FR, RL, RR] 을 배정한다. 정상은 -1.
 
-    target_leg:
-        "env_fixed":
-            env_id % (healthy_slots + 4)로 조건을 고정합니다.
-            리셋해도 조건이 바뀌지 않으므로 조건별 학습 스텝 수가 구조적으로
-            균등하고, 부목 presence 토글(CPU USD 연산)이 첫 리셋 이후 발생하지
-            않아 학습 비용이 0 이 됩니다. ← 학습 기본값
-        "random":
-            reset마다 부상 여부와 부상 다리를 다시 샘플링합니다.
-            리셋마다 presence 토글이 발생할 수 있으므로 학습보다는 평가용.
+    leg_ratios: (normal, FL, FR, RL, RR) 순 5개. 합이 1 이 아니면 정규화한다.
+
+    deterministic=True  (env_fixed): env_id 를 [0,1) 로 펼쳐 누적비율 구간에 넣는다.
+        리셋해도 조건이 안 바뀌므로 부목 presence 토글(CPU USD 연산) 비용이 0 이고,
+        조건별 학습 스텝 수가 구조적으로 균등하다.
+    deterministic=False (random): 리셋마다 같은 분포에서 다시 추첨한다.
     """
-    n = env_ids.numel()
-    mode = str(target_leg).strip().lower()
+    if leg_ratios is None:
+        raise ValueError("leg_ratios 가 필요합니다 (normal, FL, FR, RL, RR 순 5개).")
 
-    if mode == "normal" or prob_peg_leg <= 0.0:
-        return torch.full((n,), -1, device=env.device, dtype=torch.long)
-
-    # env-id 고정: 앞의 H 슬롯 = Normal, 뒤의 4 슬롯 = FL/FR/RL/RR (주기 H+4).
-    # H = healthy_slots (기본 4 → 부상 50%). 어떤 H 에서도 네 부상 조건의 env 수는
-    # 정확히 같으므로 균등 학습량이 유지됩니다.
-    if mode in {"env_fixed", "balanced_env"}:
-        healthy_slots = max(1, int(healthy_slots))
-        period = healthy_slots + 4
-        group = (env_ids % period).to(torch.long)
-
-        return torch.where(
-            group < healthy_slots, torch.full_like(group, -1), group - healthy_slots
+    ratios = torch.as_tensor(leg_ratios, dtype=torch.float32, device=env.device)
+    if ratios.numel() != 5:
+        raise ValueError(
+            f"leg_ratios 는 5개여야 합니다 (normal, FL, FR, RL, RR): {leg_ratios}"
         )
+    if bool(torch.any(ratios < 0)) or float(ratios.sum()) <= 0.0:
+        raise ValueError(f"leg_ratios 는 음수가 없고 합이 양수여야 합니다: {leg_ratios}")
 
-    # 특정 다리 고정 모드 (평가용)
-    if mode in _TARGET_LEG_MAP:
-        fixed_idx = _TARGET_LEG_MAP[mode]
-        peg_indices = torch.full((n,), fixed_idx, device=env.device, dtype=torch.long)
-        if prob_peg_leg >= 1.0:
-            return peg_indices
-        active = torch.rand((n,), device=env.device) < float(prob_peg_leg)
-        return torch.where(active, peg_indices, torch.full_like(peg_indices, -1))
+    cum = torch.cumsum(ratios / ratios.sum(), dim=0)
+    cum[-1] = 1.0 + 1e-6            # 부동소수 오차로 마지막 구간이 새지 않게
 
-    # Balanced 모드: 리셋 배치 안에서 1:1:1:1:1 (Normal, FL, FR, RL, RR) 균등 배정을
-    # 무작위 permutation 으로 수행합니다. 평가용이며, 학습은 조건별 학습량까지
-    # 균등한 env_fixed 를 기본으로 씁니다.
-    if mode in {"balanced", "balanced_random"}:
-        repeats = int(math.ceil(n / 5))
-        indices = torch.arange(5, device=env.device, dtype=torch.long).repeat(repeats)[:n]
-        perm = torch.randperm(n, device=env.device)
-        indices = indices[perm]
-        # 0=FL, 1=FR, 2=RL, 3=RR, 4=Normal(-1)
-        return torch.where(indices == 4, torch.full_like(indices, -1), indices)
+    if deterministic:
+        pos = (env_ids.to(torch.float32) + 0.5) / float(max(1, env.num_envs))
+    else:
+        pos = torch.rand((env_ids.numel(),), device=env.device)
 
-    # 라운드 로빈 모드: FL→FR→RL→RR 순환으로 정확히 균등 배정 (재현성/디버그용)
-    if mode == "round_robin":
-        if not hasattr(env, "_peg_leg_rr_counter"):
-            env._peg_leg_rr_counter = 0
-        peg_indices = torch.arange(n, device=env.device, dtype=torch.long)
-        peg_indices = (peg_indices + env._peg_leg_rr_counter) % 4
-        env._peg_leg_rr_counter = (env._peg_leg_rr_counter + n) % 4
-        if prob_peg_leg >= 1.0:
-            return peg_indices
-        active = torch.rand((n,), device=env.device) < float(prob_peg_leg)
-        return torch.where(active, peg_indices, torch.full_like(peg_indices, -1))
+    bucket = torch.searchsorted(cum.contiguous(), pos.contiguous()).clamp(max=4)
+    # bucket 0 = Normal(-1), 1~4 = FL/FR/RL/RR (0~3)
+    return torch.where(bucket == 0, torch.full_like(bucket, -1), bucket - 1)
 
-    # Random 모드: 부상 여부는 확률로 정하되, 부상 다리 라벨은 FL/FR/RL/RR가
-    # 거의 정확히 균등하도록 stratified permutation 으로 배정합니다.
-    if mode != "random":
-        mode = "random"
-    active = torch.rand((n,), device=env.device) < float(prob_peg_leg)
-    if prob_peg_leg >= 1.0:
-        active = torch.ones((n,), device=env.device, dtype=torch.bool)
+_LEG_LINK_LENGTH = 0.213      # Go1 thigh / calf 링크 길이 (URDF)
 
-    result = torch.full((n,), -1, device=env.device, dtype=torch.long)
-    num_active = int(active.sum().item())
-    if num_active == 0:
-        return result
 
-    repeats = int(math.ceil(num_active / 4))
-    leg_labels = torch.arange(4, device=env.device, dtype=torch.long).repeat(repeats)[:num_active]
-    leg_labels = leg_labels[torch.randperm(num_active, device=env.device)]
-    result[torch.where(active)[0]] = leg_labels
-    return result
+def _sample_calf_fold_angle(
+    splint_lengths: torch.Tensor,
+    injured: torch.Tensor,
+    *,
+    random_mode: bool,
+    fixed_angle: float,
+    min_fold: float,
+    max_fold: float,
+    padding: float,
+) -> torch.Tensor:
+    """env 별 calf 접힘각 [rad]. 정상 env 는 0.
+
+    thigh joint → 발 거리는 reach(q) = 2*L_link*|cos(q/2)| 이므로,
+    발끝이 부목 끝단보다 padding 만큼 안쪽에 오는 각은
+        a = -2*arccos((splint_length - padding) / (2*L_link))
+    이다. 이 a 를 [min_fold, max_fold] 로 클리핑해 상한으로 쓰고,
+    [min_fold, 상한] 에서 균등 추첨한다.
+
+    부목이 다리 최대신장(2*L_link)보다 길면 a 가 0 에 붙으므로
+    max_fold 가 상한을 결정한다 (무릎이 펴지는 것을 막는다).
+    """
+    if not random_mode:
+        angles = torch.full_like(splint_lengths, float(fixed_angle))
+        return torch.where(injured, angles, torch.zeros_like(angles))
+
+    span = 2.0 * _LEG_LINK_LENGTH
+    ratio = torch.clamp((splint_lengths - float(padding)) / span, max=1.0)
+    a = -2.0 * torch.acos(ratio)
+
+    upper = torch.clamp(a, min=float(min_fold), max=float(max_fold))
+    lower = torch.full_like(upper, float(min_fold))
+
+    angles = lower + (upper - lower) * torch.rand_like(upper)
+    return torch.where(injured, angles, torch.zeros_like(angles))
 
 
 def _get_peg_leg_per_env(
@@ -499,19 +479,21 @@ def randomize_peg_leg_actuation(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
-    prob_peg_leg: float = 1.0,
-    prob_joint_disabled: float = 1.0,
     splint_length_range: tuple[float, float] = (0.33, 0.45),
     foot_friction_range: tuple[float, float] = (0.2, 1.2),
     injured_splint_friction_only: bool = True,
-    target_leg: str = "random",
-    fold_knee_angle: float = -2.55,
+    calf_random: bool = False,
+    calf_fixed_angle: float = -2.55,
+    calf_min_fold: float = -2.55,
+    calf_max_fold: float = -1.0,
+    calf_padding: float = 0.02,
     attach: str = "thigh",
     hip_torque_scale: float = 1.0,
     weaken_joints: str = "hip",
     splint_calf_stiffness: float | None = None,
     splint_calf_damping: float = 0.5,
-    healthy_slots: int = 4,
+    leg_deterministic: bool = True,
+    leg_ratios=None,
 ):
     """부목 부상 시나리오 리셋 이벤트.
 
@@ -519,9 +501,6 @@ def randomize_peg_leg_actuation(
       (1) 부상 다리 / 부목 길이 L / 부목 끝단 마찰을 샘플링해 버퍼에 저장
       (2) 부목 presence 를 diff 로 갱신 (바뀐 env 만 — env_fixed 면 첫 리셋뿐)
       (3) 부목 관절을 L 로 배치하고 per-env limit + drive target 으로 잠금
-      (4) 부상 calf 를 fold_knee_angle 로 접고 default_joint_pos 를 재작성
-          — joint_pos_rel 관측에서 fold 각이 소거되고, 그 소거 보상은
-          calf_pos_nominal_rel 관측이 담당합니다
       (5) hip effort_limit 약화 / calf 강성 / 부목 끝단 마찰을 물리에 적용
 
     관절을 실제로 붙잡는 것은 Go1LabEnv._enforce_peg_leg_joint_targets (매 sub-step
@@ -534,21 +513,13 @@ def randomize_peg_leg_actuation(
     _ensure_splint_layout(env, robot)
     _ensure_calf_action_ids(env, robot)
 
-    # 커리큘럼 파라미터 우선 적용
-    cur_prob = getattr(env, "_curriculum_prob_peg_leg", None)
-    cur_splint = getattr(env, "_curriculum_splint_range", None)
-    effective_prob = float(cur_prob) if cur_prob is not None else prob_peg_leg
-    effective_splint = cur_splint if cur_splint is not None else splint_length_range
 
     # ━━━ 샘플링 ━━━
-    sampled_leg_idx = _sample_peg_leg_indices(
-        env,
-        env_ids_t,
-        prob_peg_leg=effective_prob,
-        target_leg=target_leg,
-        healthy_slots=healthy_slots,
+    sampled_leg_idx = _assign_leg_by_ratio(
+        env, env_ids_t, leg_ratios, deterministic=leg_deterministic
     )
-    sampled_lengths = _sample_splint_lengths(env, env_ids_t, effective_splint)
+
+    sampled_lengths = _sample_splint_lengths(env, env_ids_t, splint_length_range)
     sampled_foot_friction = _sample_foot_friction(
         env, env_ids_t, friction_range=foot_friction_range
     )
@@ -561,9 +532,7 @@ def randomize_peg_leg_actuation(
         healthy, torch.zeros_like(sampled_foot_friction), sampled_foot_friction
     )
     # calf 잠금 여부 (기본 1.0 → 부상이면 항상 잠금)
-    lock_active = (~healthy) & (
-        torch.rand((n,), device=env.device) < float(prob_joint_disabled)
-    )
+    lock_active = (~healthy)
 
     # ━━━ (1) 부목 presence — 바뀐 env 만 갱신 ━━━
     prev_leg = env._peg_leg_index[env_ids_t]
@@ -578,16 +547,17 @@ def randomize_peg_leg_actuation(
             env_ids=env_ids_t[changed],
         )
 
-    # ━━━ RLS 추정 상태 리셋 (에피소드마다 L 재추첨 → prior 복귀) ━━━
-    reset_rls(env, env_ids_t)
-
     # ━━━ 버퍼 저장 ━━━
-    fold = float(fold_knee_angle)
-    env._peg_leg_calf_lock_angle[env_ids_t] = torch.where(
-        lock_active,
-        torch.full((n,), fold, device=env.device),
-        torch.zeros((n,), device=env.device),
+    fold_angles = _sample_calf_fold_angle(
+        sampled_lengths, lock_active,
+        random_mode=calf_random,
+        fixed_angle=calf_fixed_angle,
+        min_fold=calf_min_fold,
+        max_fold=calf_max_fold,
+        padding=calf_padding,
     )
+    env._peg_leg_calf_lock_angle[env_ids_t] = fold_angles
+
     env._peg_leg_splint_length[env_ids_t] = sampled_lengths
     env._peg_leg_foot_friction[env_ids_t] = sampled_foot_friction
     env._peg_leg_lock_active[env_ids_t] = lock_active
@@ -603,8 +573,6 @@ def randomize_peg_leg_actuation(
         env, robot, env_ids_t, locked_leg_idx, splint_calf_stiffness, splint_calf_damping
     )
 
-    # ━━━ default_joint_pos: 원본 복구 후 잠긴 calf 를 fold 각으로 재작성 ━━━
-    # joint_pos_rel = joint_pos - default 이므로 잠긴 calf 채널이 ≈0 이 됩니다.
     # action offset 은 액션 항 init 시 clone 된 값이라 action 경로에는 영향 없음.
     if hasattr(robot.data, "default_joint_pos"):
         if env._peg_leg_default_joint_pos_ref is None:
@@ -633,17 +601,9 @@ def randomize_peg_leg_actuation(
         if calf_action_ids[k] >= 0:
             env._peg_leg_calf_action_index[sel] = calf_action_ids[k]
 
-        # (a) default / target 을 fold 각으로
-        if robot.data.default_joint_pos.ndim == 2:
-            robot.data.default_joint_pos[sel, calf_j] = fold
-        if (
-            hasattr(robot.data, "joint_pos_target")
-            and robot.data.joint_pos_target.ndim >= 2
-        ):
-            robot.data.joint_pos_target[sel, calf_j] = fold
 
         # (b) 실제 PhysX 관절 상태를 fold 각에 배치
-        ang = torch.full((sel.numel(), 1), fold, device=robot.device)
+        ang = fold_angles[mask].to(robot.device).unsqueeze(-1)
         robot.write_joint_state_to_sim(
             position=ang,
             velocity=torch.zeros_like(ang),
@@ -787,65 +747,3 @@ def enforce_peg_leg_constraints(
         ] = lock_angles[locked_env_ids]
 
 
-# =====================================================================
-# 커리큘럼 함수
-# =====================================================================
-
-
-def peg_leg_curriculum(
-    env: "ManagerBasedRLEnv",
-    env_ids,
-    prob_start: float = 0.1,
-    prob_end: float = 0.5,
-    prob_ramp_steps: int = 3000,
-    splint_start: float = 0.36,
-    splint_end: float = 0.45,
-    splint_lo_start: float | None = None,
-    splint_lo_end: float | None = None,
-    splint_ramp_steps: int = 5000,
-    steps_per_iteration: int = 24,
-    target_leg: str = "random",
-    healthy_slots: int = 4,
-) -> dict:
-    """부상 난이도를 학습 진행에 따라 점진적으로 증가시키는 커리큘럼.
-
-    부목 길이 상한을 splint_start(쉬움: nominal leg reach 에 가까움)에서
-    splint_end(어려움: 긴 죽마)로 램프합니다. env_fixed 모드에서는 부상 확률이
-    env id 로 고정되므로 prob 램프는 로깅 용도로만 의미가 있습니다.
-    """
-    steps_per_iteration = max(1, int(steps_per_iteration))
-    step = env.common_step_counter / steps_per_iteration
-
-    # ━━━ (1) 부상 확률 커리큘럼 ━━━
-    prob_alpha = min(1.0, step / max(1, prob_ramp_steps))
-    cur_prob = prob_start + (prob_end - prob_start) * prob_alpha
-
-    # ━━━ (2) 부목 길이 커리큘럼 ━━━
-    splint_alpha = min(1.0, step / max(1, splint_ramp_steps))
-    cur_splint_hi = splint_start + (splint_end - splint_start) * splint_alpha
-    if splint_lo_start is None or splint_lo_end is None:
-        # 하한은 상한의 80%로 유지 (기존 동작)
-        cur_splint_lo = max(SPLINT_MIN, cur_splint_hi * 0.8)
-    else:
-        cur_splint_lo = splint_lo_start + (splint_lo_end - splint_lo_start) * splint_alpha
-        cur_splint_lo = max(SPLINT_MIN, min(cur_splint_lo, cur_splint_hi))
-    cur_splint_hi = min(cur_splint_hi, SPLINT_MAX)
-
-    # env에 커리큘럼 파라미터 저장 → randomize_peg_leg_actuation이 읽음
-    env._curriculum_prob_peg_leg = cur_prob
-    env._curriculum_splint_range = (cur_splint_lo, cur_splint_hi)
-
-    # TensorBoard 에는 '실제' 부상 비율을 보고합니다. env_fixed 모드는 prob_peg_leg 를
-    # 무시하고 조건을 env id 에 고정하므로, 램프 값을 그대로 로깅하면 어긋납니다.
-    target_mode = target_leg.strip().lower()
-
-    if target_mode in {"env_fixed", "balanced_env"}:
-        reported_prob = 4.0 / (int(healthy_slots) + 4)
-    else:
-        reported_prob = cur_prob
-
-    return {
-        "prob_peg_leg": reported_prob,
-        "splint_hi": cur_splint_hi,
-        "splint_lo": cur_splint_lo,
-    }

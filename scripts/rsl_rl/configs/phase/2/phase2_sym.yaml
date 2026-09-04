@@ -12,17 +12,20 @@ train:
 
   num_envs: 2048
   max_iterations: 6000
+  normalize: false
   seed: 42
+  num_steps_per_env: 24
 
 checkpoint:
   mode: "warmstart"
-  teacher: /home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_08_12_23_51_57_phase1_s42_P1-splint-001/model_4999.pt
+  teacher: ""
   student: ""
   load_optimizer: false
   reset_iteration: false
+  reset_noise_std: true    # warmstart 시 init_noise_std 로 std 를 되돌린다
 
 env:
-  path: ../env/antalgic.yaml
+  path: ../../env/antalgic.yaml
   overrides:
     name: joint_symmetric
     reward:
@@ -42,8 +45,6 @@ exploration:
       scalar:
         init_noise_std: 1.0
         min_action_std: 0.001
-        enforce_min_std: true
       log:
-        init_noise_std: 1.0
+        init_noise_std: 0.3
         min_action_std: 0.001
-        enforce_min_std: true

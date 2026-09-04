@@ -1,9 +1,19 @@
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+@dataclass
+class MseNormConfig:
+    """phase 3 출력 정규화 상수 (train.mse_norm). compute_output_norm.py 가 만든 mse_norm.yaml 값을 넣는다."""
+    enable: bool = False
+    action_mean: float | list[float] = 0.0   # 12 관절 리스트, 또는 스칼라 (broadcast)
+    action_pstd: float = 0.0                  # 12 관절 pooled std
+    splint_mean: float = 0.0
+    splint_std: float = 0.0
+    vel_mean: float | list[float] = 0.0       # 3 축 리스트, 또는 스칼라
+    vel_pstd: float = 0.0                     # 3 축 pooled std
 
 @dataclass
 class ExplorationConfig:
@@ -24,6 +34,12 @@ class TrainConfig:
     num_envs: int
     max_iterations: int | None
     seed: int
+    num_steps_per_env: int  
+    normalize: bool = False 
+    gradient_length: int | None = None # For phase3
+    splint_loss_coef: float | None = None # For phase3
+    vel_loss_coef: float | None = None # For phase3
+    mse_norm: MseNormConfig | None = None # For phase3
 
 @dataclass
 class EnvironmentConfig:
@@ -37,7 +53,8 @@ class CheckpointConfig:
     student: str | None
     load_optimizer: bool
     reset_iteration: bool
-
+    reset_noise_std: bool = True
+    
 @dataclass
 class ExperimentConfig:
     phase: str
@@ -88,7 +105,7 @@ def read_yaml(config_path: str | Path) -> dict[str, Any]:
 
     return configs
 
-def parse_exploration_config(phase_cfg: dict) -> ExplorationConfig:
+def load_exploration_config(phase_cfg: dict) -> ExplorationConfig:
     exploration_raw = phase_cfg.get("exploration", {})
     noise_std_raw = exploration_raw.get("noise_std", {})
 
@@ -160,7 +177,11 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
     common_cfg = read_yaml(common_path)
 
     # train
-    train_cfg = TrainConfig(**phase_cfg["train"])
+    train_raw = dict(phase_cfg["train"])
+    mse_norm_cfg = load_mse_norm_config(train_raw)   # train.mse_norm 검증 (enable 이면 std > 0, 길이 12 / 3)
+    train_raw.pop("mse_norm", None)
+
+    train_cfg = TrainConfig(**train_raw, mse_norm=mse_norm_cfg)
     checkpoint_cfg = CheckpointConfig(**phase_cfg["checkpoint"])
     
     # evaluation
@@ -196,12 +217,26 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
     
     environment_cfg = EnvironmentConfig(path=env_path, values=environment_values)
 
-    exploration_cfg = parse_exploration_config(phase_cfg)
+    exploration_cfg = load_exploration_config(phase_cfg)
 
     # 변형 phase 파일(예: phase2_ft.yaml — ablation)도 base phase 로 정규화한다.
     # train.py 의 runner 선택/exploration 분기가 phase1/2/3 문자열에 의존하기 때문.
-    phase_match = re.match(r"(phase\d+)", phase_path.stem)
-    phase_name = phase_match.group(1) if phase_match else phase_path.stem
+    folder = phase_path.parent.name
+
+    if folder not in ("1", "2", "3"):
+        raise ValueError(
+            "phase yaml 은 configs/phase/<1|2|3>/ 아래에 두어야 합니다. "
+            f"현재 폴더: {folder!r} — {phase_path}"
+        )
+
+    phase_name = f"phase{folder}"
+
+    expected_agent = f"rsl_rl_phase{folder}_cfg_entry_point"
+    if train_cfg.agent != expected_agent:
+        raise ValueError(
+            f"폴더({folder}) 와 train.agent({train_cfg.agent!r}) 가 다릅니다. "
+            f"기대값: {expected_agent!r} — {phase_path}"
+        )
 
     return ExperimentConfig(
         phase=phase_name,
@@ -213,3 +248,33 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
         exploration=exploration_cfg,
         rsl_logger=common_cfg.get("rsl_logger", "tensorboard"),
     )
+
+def load_mse_norm_config(train_raw: dict) -> MseNormConfig | None:
+    raw = train_raw.get("mse_norm")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError("train.mse_norm must be a dictionary")
+    cfg = MseNormConfig(**raw)              # 모르는 키가 있으면 TypeError 로 즉시 실패
+    cfg.enable = bool(cfg.enable)
+    if not cfg.enable:
+        return cfg                          # 비활성: 나머지 값은 검사도 사용도 하지 않는다
+
+    for name, n in (("action_mean", 12), ("vel_mean", 3)):
+        v = getattr(cfg, name)
+        if isinstance(v, (list, tuple)):
+            if len(v) != n:
+                raise ValueError(f"train.mse_norm.{name} 길이 {len(v)} != {n}")
+            setattr(cfg, name, [float(x) for x in v])
+        else:
+            setattr(cfg, name, float(v))
+    for name in ("action_pstd", "splint_std", "vel_pstd"):
+        v = float(getattr(cfg, name))
+        if not v > 0.0:
+            raise ValueError(
+                f"train.mse_norm.{name} 는 enable=true 일 때 0 보다 커야 합니다 (현재 {v}). "
+                "compute_output_norm.py 가 만든 mse_norm.yaml 값을 채우세요."
+            )
+        setattr(cfg, name, v)
+    cfg.splint_mean = float(cfg.splint_mean)
+    return cfg

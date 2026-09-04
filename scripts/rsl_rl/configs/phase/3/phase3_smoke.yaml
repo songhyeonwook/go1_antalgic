@@ -1,0 +1,41 @@
+# Phase 3 스모크 테스트 전용 (형상/경로/학습 루프 확인). 64 env, 2 iteration.
+# teacher 는 형상 확인용 phase-1 체크포인트 (actor 입력 53 = policy 49 + privileged 4).
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase3_cfg_entry_point
+
+  num_envs: 64
+  max_iterations: 2
+  normalize: false
+  seed: 42
+
+  num_steps_per_env: 50
+  gradient_length: 50
+  splint_loss_coef: 0.7   # 스모크: 전파 확인용으로 기본값(0.5)과 다른 값
+  vel_loss_coef: 1.3      # 스모크: 전파 확인용으로 기본값(1.0)과 다른 값
+
+checkpoint:
+  mode: "distill"
+  teacher: /home/robotserver/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_09_01_18_46_36_phase1_s42_P1-raw-001/model_4999.pt
+  student: ""
+  load_optimizer: false
+  reset_iteration: true
+  reset_noise_std: false
+
+env:
+  path: ../../env/antalgic.yaml
+
+eval:
+  peg_leg: normal
+
+exploration:
+  noise_std:
+    set: log
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+      log:
+        init_noise_std: 0.05
+        min_action_std: 0.001

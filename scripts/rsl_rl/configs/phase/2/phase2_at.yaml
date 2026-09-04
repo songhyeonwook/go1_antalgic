@@ -1,0 +1,40 @@
+# cd /home/robotserver/wj/go1_antalgic/scripts/rsl_rl && nohup /home/robotserver/wj/.venvs/isaaclab-5.1-antalgic/bin/python train.py --phase_config_path configs/phase/2/phase2_at.yaml --run_tag P2-AT-001 --headless --debug_obs --debug_obs_envs 10 > logs/p2_at_001.out 2>&1 &
+train:
+  project_name: unitree_go1_antalgic
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase2_cfg_entry_point
+
+  num_envs: 2048
+  max_iterations: 6000 # 8000, 500
+  normalize: false
+  seed: 42
+
+  num_steps_per_env: 24
+    
+checkpoint:
+  mode: "warmstart" # warmstart, resume
+  teacher: "/home/robotserver/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_09_03_16_34_40_phase1_s42_P1-001/model_4999.pt"
+  student: ""
+  load_optimizer: false # false, true
+  reset_iteration: false 
+  reset_noise_std: true    # warmstart 시 init_noise_std 로 std 를 되돌린다
+
+env:
+  path: ../../env/antalgic.yaml
+
+eval:
+  peg_leg: normal # normal, fl, fr, rl, rr
+
+exploration:
+  noise_std:
+    # 실제 사용할 탐색 노이즈 방식
+    set: log  # scalar 또는 log
+
+    types:
+      scalar:
+        init_noise_std: 1.0
+        min_action_std: 0.001
+
+      log:
+        init_noise_std: 0.3 # 0.3부터 시작
+        min_action_std: 0.001
