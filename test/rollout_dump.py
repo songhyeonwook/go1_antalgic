@@ -6,26 +6,33 @@
   [2] 토크 잔차 접촉 감지기 채점 — GT 접촉력(sim 전용)으로 정밀도/재현율 측정
   [3] 보행 형태 분석 — 부목 duty factor, 착지 규칙성 (RLS 등식 공급량)
   [4] L 식별 가능성 — 관절각만으로 L 이 새는지 재확인
+  [5] 통증 C_pain 분포 — penalty_pain 이 매 스텝 반환한 원시값 (pain_report.py)
+
+env / agent / 체크포인트 로딩은 test.py / play_result.py 와 같은 utils.eval_common
+경로를 쓴다 (phase yaml → ExperimentConfig → 레지스트리 cfg → runner).
 
 사용 (phase 2 종료 후):
     cd /home/shw/go1_lod/test
     PYTHONPATH=/home/shw/go1_lod/source/go1_lab python3 rollout_dump.py \
-        --phase 2 --checkpoint <model_*.pt 경로> \
+        --phase_config_path ../scripts/rsl_rl/configs/phase/2/phase2_at.yaml \
+        --checkpoint <model_*.pt 경로> \
         --num_envs 40 --steps 2500 --out dumps/p2_balanced.npz
 
-    # 조건: balanced(기본) = env_id 고정 1:1:1:1:1 (Normal/FL/FR/RL/RR)
-    #       train          = 학습과 동일한 env_fixed 배정 (정상 50%)
+    # 조건(--peg_leg): balanced(기본) = env 블록 1:1:1:1:1 (Normal/FL/FR/RL/RR)
+    #                 normal/fl/fr/rl/rr = 단일 조건
 
 ⚠️ 평가용 덤프이므로 peg-leg 커리큘럼은 비활성화한다 — 켜두면 step counter가
-0 이라 부목 길이가 초기 좁은 범위 [0.33, 0.36] 로 고정되어 L 커버리지가 죽는다.
+0 이라 부목 길이가 초기 좁은 범위로 고정되어 L 커버리지가 죽는다.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -34,18 +41,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RSL_DIR = SCRIPT_DIR.parent / "scripts" / "rsl_rl"
 sys.path.insert(0, str(RSL_DIR))
 
-from utils.config_builder import load_experiment_config  # noqa: E402
-from utils.rsl_rl_compat import patch_rsl_rl_agent_cfg  # noqa: E402
+from utils.eval_common import (  # noqa: E402
+    LEGS, add_common_args, build_agent_cfg, build_env_cfg, check_splint_length_arg,
+    load_config, log, make_gym_env, make_policy, peg_leg_enabled, print_conditions,
+    print_header, resolve_checkpoint, resolve_eval_mode, step_env, wrap_rsl,
+)
 
 parser = argparse.ArgumentParser(description="정책 롤아웃을 npz 로 덤프")
-parser.add_argument("--phase", type=int, choices=(2, 3), default=2)
-parser.add_argument("--checkpoint", type=str, required=True)
-parser.add_argument("--num_envs", type=int, default=40)
+add_common_args(parser)
 parser.add_argument("--steps", type=int, default=2500, help="50 Hz 기준 2500 step = 50 s")
 parser.add_argument("--warmup", type=int, default=100, help="기록 전 버리는 초기 step")
-parser.add_argument("--seed", type=int, default=None)
-parser.add_argument("--condition", choices=("balanced", "train"), default="balanced",
-                    help="balanced: env_id 고정 1:1:1:1:1 / train: 학습과 동일(env_fixed)")
 parser.add_argument("--fixed_x", type=float, default=None, help="전진 명령 고정 (기본: 샘플링)")
 parser.add_argument("--fixed_mu", type=float, default=None,
                     help="부목 끝단 마찰 고정 (μ 강건성 스윕용, 기본: yaml 범위 샘플링)")
@@ -55,92 +60,62 @@ parser.add_argument("--l_obs_offset", type=float, default=None,
                     help="정책의 GT L 채널에 더할 오프셋 [m] — 물리는 그대로")
 parser.add_argument("--out", type=str, default=None, help="저장 경로 (.npz). 기본: dumps/<체크포인트명>.npz")
 AppLauncher.add_app_launcher_args(parser)
-args, hydra_args = parser.parse_known_args()
+args, _ = parser.parse_known_args()
 args.headless = True
-
-phase_config_path = RSL_DIR / "configs" / "phase" / f"phase{args.phase}.yaml"
-config = load_experiment_config(
-    phase_path=phase_config_path,
-    common_path=str(RSL_DIR / "configs" / "common.yaml"),
-)
-
-sys.argv = [sys.argv[0], *hydra_args,
-            "hydra/job_logging=disabled", "hydra.output_subdir=null", "hydra.run.dir=."]
+check_splint_length_arg(args.splint_length)
 
 if args.fixed_mu is not None and not (0.0 < args.fixed_mu <= 4.0):
     parser.error(f"--fixed_mu 는 (0, 4] 범위여야 합니다: {args.fixed_mu} "
                  "(음수는 PhysX 가 조용히 0 으로 클램프해 라벨-실측 불일치 발생)")
 
+config = load_config(args)
+checkpoint_path = resolve_checkpoint(args)
+if not peg_leg_enabled(config):
+    raise RuntimeError("peg_leg.enabled=true 환경(phase 2/3 yaml)에서만 덤프할 수 있습니다.")
+eval_mode = resolve_eval_mode(args, config, default="balanced")
+num_envs = args.num_envs if args.num_envs is not None else 40
+seed = args.seed if args.seed is not None else config.train.seed
+device = args.device
+
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 # ── Isaac Sim 시작 이후 import ──────────────────────────────────────────
-import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner  # noqa: E402
-from isaaclab.envs import ManagerBasedRLEnvCfg  # noqa: E402
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper  # noqa: E402
-import isaaclab_tasks  # noqa: F401, E402
-from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
-import go1_lab.tasks  # noqa: F401, E402
 
-LEGS = ("FL", "FR", "RL", "RR")
-
-
-@hydra_task_config(config.train.task, config.train.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint 없음: {checkpoint_path}")
-
+def resolve_out_path() -> Path:
     if args.out:
-        out_path = Path(args.out).expanduser().resolve()
-    elif args.l_obs_fixed is not None or args.l_obs_offset is not None:
+        return Path(args.out).expanduser().resolve()
+    if args.l_obs_fixed is not None or args.l_obs_offset is not None:
         tag = (f"fix{args.l_obs_fixed}" if args.l_obs_fixed is not None
                else f"off{args.l_obs_offset:+g}")
-        out_path = SCRIPT_DIR / "dumps" / f"lsens_{tag}.npz"
-    elif args.fixed_mu is not None:
+        return SCRIPT_DIR / "dumps" / f"lsens_{tag}.npz"
+    if args.fixed_mu is not None:
         # μ 스윕 계약: mu_robustness_report.py 가 이 이름을 읽는다.
         # μ 를 파일명에 넣지 않으면 스윕 실행이 서로를 덮어쓴다.
-        out_path = SCRIPT_DIR / "dumps" / f"mu_sweep_{args.fixed_mu}.npz"
-    else:
-        out_path = (SCRIPT_DIR / "dumps" /
-                    f"{checkpoint_path.parent.name}_{checkpoint_path.stem}_{args.condition}.npz")
+        return SCRIPT_DIR / "dumps" / f"mu_sweep_{args.fixed_mu}.npz"
+    return (SCRIPT_DIR / "dumps" /
+            f"{checkpoint_path.parent.name}_{checkpoint_path.stem}_{eval_mode}.npz")
+
+
+def main() -> None:
+    out_path = resolve_out_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    seed = args.seed if args.seed is not None else config.train.seed
-    device = config.common.get("device", "cuda:0")
-
-    agent_cfg.seed = seed
-    agent_cfg.device = device
-    exploration = config.exploration
-    agent_cfg.policy.noise_std_type = exploration.noise_std_type
-    agent_cfg.policy.init_noise_std = exploration.init_noise_std
-
-    env_cfg.scene.num_envs = args.num_envs
-    env_cfg.sim.device = device
-    env_cfg.seed = seed
-    env_cfg.apply_environment_settings(
-        config.environment.values, int(agent_cfg.num_steps_per_env)
+    env_cfg = build_env_cfg(
+        config, num_envs=num_envs, seed=seed, device=device, eval_mode=eval_mode,
+        splint_length=args.splint_length, clean=args.clean,
     )
+    agent_cfg = build_agent_cfg(config, seed=seed, device=device)
 
-    # ── 평가 조건 설정 ──
     peg_event = env_cfg.events.randomize_peg_leg_actuation
-    if peg_event is None:
-        raise RuntimeError("peg_leg.enabled=true 환경에서만 덤프할 수 있습니다.")
-    if args.condition == "balanced":
-        # env_id 고정: env0=Normal, env1..4=FL/FR/RL/RR, env5=Normal, ... (주기 5)
-        peg_event.params["target_leg"] = "balanced_env"
-        peg_event.params["healthy_slots"] = 1
-    # "train" 은 yaml 그대로 (env_fixed, healthy_slots=4)
-
     if args.fixed_mu is not None:
         # μ 강건성 평가: 부목 끝단 마찰을 단일 값으로 고정 (DR 범위 밖 외삽 가능)
         peg_event.params["foot_friction_range"] = (args.fixed_mu, args.fixed_mu)
 
-    # 커리큘럼 제거 — 평가에서는 전체 L 범위 [0.33, 0.45] 를 그대로 샘플해야 한다
+    # 커리큘럼 제거 — 평가에서는 yaml 의 전체 L 범위를 그대로 샘플해야 한다
     if getattr(env_cfg.curriculum, "peg_leg_difficulty", None) is not None:
         env_cfg.curriculum.peg_leg_difficulty = None
 
@@ -150,15 +125,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         ranges.lin_vel_y = (0.0, 0.0)
         ranges.ang_vel_z = (0.0, 0.0)
 
-    env = gym.make(config.train.task, cfg=env_cfg, render_mode=None)
+    print_header(config, checkpoint_path, device, seed, num_envs, eval_mode, env_cfg)
+    env = wrap_rsl(make_gym_env(config, env_cfg), agent_cfg)
     base = env.unwrapped
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
-    agent_cfg_dict = patch_rsl_rl_agent_cfg(agent_cfg.to_dict())
-    runner_cls = OnPolicyRunner if agent_cfg.class_name == "OnPolicyRunner" else DistillationRunner
-    runner = runner_cls(env=env, train_cfg=agent_cfg_dict, log_dir=None, device=device)
-    runner.load(str(checkpoint_path), load_optimizer=False, map_location=device)
-    policy = runner.get_inference_policy(device=base.device)
+    print_conditions(base)
+    _, policy_fn, policy_module = make_policy(env, agent_cfg, config, checkpoint_path, device)
 
     # ── 인덱스 준비 (이름 기반) ──
     robot = base.scene["robot"]
@@ -177,7 +148,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     rb_splint = [robot_bodies.index(f"{leg}_splint") for leg in LEGS]
     rb_thigh = [robot_bodies.index(f"{leg}_thigh") for leg in LEGS]
 
-    N, T = args.num_envs, args.steps
+    # C_pain: reward manager 의 _step_reward 는 func·weight (dt 제거) 이므로
+    # weight 로 나누면 penalty_pain 이 이 스텝에 반환한 원시 C_pain 이 된다.
+    # 직접 재호출하지 않는 이유: step 내부 리셋 이후 센서 버퍼가 바뀔 수 있어
+    # "리워드가 본 값" 과 어긋난다.
+    rm = base.reward_manager
+    pain_idx = rm.active_terms.index("penalty_pain") if "penalty_pain" in rm.active_terms else None
+    pain_weight = float(rm.get_term_cfg("penalty_pain").weight) if pain_idx is not None else 0.0
+    pain_params = ({k: v for k, v in rm.get_term_cfg("penalty_pain").params.items()
+                    if isinstance(v, (int, float, bool, str))} if pain_idx is not None else {})
+    if pain_idx is None or pain_weight == 0.0:
+        log("[WARN] penalty_pain 리워드 항 없음/가중치 0 — pain 은 0 으로 기록")
+        pain_idx = None
+
+    N, T = num_envs, args.steps
     rec: dict[str, list] = {k: [] for k in (
         "obs_policy", "obs_privileged", "action",
         "joint_pos", "joint_vel", "applied_torque_leg",
@@ -185,18 +169,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "contact_splint", "contact_foot", "contact_calf",
         "gt_leg", "gt_L", "gt_mu", "lock_active", "dones",
         "pos_feet_w", "pos_splint_w", "pos_thigh_w",
+        "pain",
     )}
 
     def grab(t: torch.Tensor) -> np.ndarray:
         return t.detach().cpu().numpy().astype(np.float32)
 
     obs = env.get_observations()
-    print(f"[INFO] 덤프 시작: N={N}, steps={T} (+warmup {args.warmup}), 조건={args.condition}")
-    print(f"[INFO] 체크포인트: {checkpoint_path}")
+    priv_dim = int(base.obs_buf["privileged_obs"].shape[1])
+    log(f"[INFO] 덤프 시작: N={N}, steps={T} (+warmup {args.warmup}), 조건={eval_mode}")
+    log(f"[INFO] privileged obs dim={priv_dim}, pain term={'있음' if pain_idx is not None else '없음'} "
+        f"(weight={pain_weight})")
     t0 = time.time()
 
-    # privileged 레이아웃: onehot(5) L(1) lin_vel(3) — flag=4, L=5 (μ 제거 이후에도 동일)
-    L_OBS_IDX, FLAG_OBS_IDX = 5, 4
+    # privileged 레이아웃: L(1) lin_vel(3) — L 채널은 index 0 (Go1LabPrivilegedObsCfg).
+    # 부상 env 마스크는 obs 가 아니라 GT 버퍼(_peg_leg_index)로 잡는다.
+    L_OBS_IDX = 0
     _perturb_l = args.l_obs_fixed is not None or args.l_obs_offset is not None
 
     def perturb(o):
@@ -205,7 +193,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             return o
         o = o.clone()
         p = o["privileged_obs"]
-        m = p[:, FLAG_OBS_IDX] > 0.5
+        m = base._peg_leg_index >= 0
         if args.l_obs_fixed is not None:
             p[m, L_OBS_IDX] = args.l_obs_fixed
         if args.l_obs_offset is not None:
@@ -214,10 +202,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
 
     with torch.inference_mode():
         for step in range(args.warmup + T):
-            actions = policy(perturb(obs))
-            obs, _, dones, _ = env.step(actions)
-            if getattr(runner.alg.policy, "is_recurrent", False):
-                runner.alg.policy.reset(dones)
+            obs, _, dones, _, actions = step_env(env, policy_fn, policy_module, perturb(obs))
 
             if step < args.warmup:
                 continue
@@ -243,12 +228,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             rec["gt_mu"].append(grab(base._peg_leg_foot_friction))
             rec["lock_active"].append(base._peg_leg_lock_active.detach().cpu().numpy())
             rec["dones"].append(dones.detach().cpu().numpy().astype(bool).reshape(-1))
+            if pain_idx is not None:
+                rec["pain"].append(grab(rm._step_reward[:, pain_idx] / pain_weight))
+            else:
+                rec["pain"].append(np.zeros(N, dtype=np.float32))
 
     arrays = {k: np.stack(v) for k, v in rec.items()}  # (T, N, ...)
+    # env 별 체중 mg [N] — penalty_pain 의 θ = threshold_bw·mg, ρ = scale_bw·mg 재계산용
+    try:
+        from go1_lab.tasks.manager_based.go1_lab.mdp.rewards import _body_weight_tensor
+        arrays["body_weight_n"] = _body_weight_tensor(base).detach().cpu().numpy()  # (N,)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[WARN] body_weight_n 계산 실패 ({exc}) — pain_report 는 --body_weight_n 사용")
     meta = {
         "checkpoint": str(checkpoint_path),
-        "phase": args.phase,
-        "condition": args.condition,
+        "phase": config.phase,
+        "phase_config": str(Path(args.phase_config_path).expanduser().resolve()),
+        "condition": eval_mode,
         "num_envs": N,
         "steps": T,
         "warmup": args.warmup,
@@ -264,20 +260,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "legs": list(LEGS),
         "contact_body_order": "LEGS 순서 (FL, FR, RL, RR), net_forces_w [N] xyz",
         "gt_leg_convention": "-1=정상, 0=FL, 1=FR, 2=RL, 3=RR",
-        "obs_policy_layout": "ang_vel(3) gravity(3) cmd(3) jpos(12) jvel(12) act(12) calf_nom(4) rls(2)",
-        "obs_privileged_layout": "onehot(5) L(1) mu(1) lin_vel(3)",
+        "obs_privileged_layout": "L(1) lin_vel(3)",
+        "pain_weight": pain_weight,
+        "pain_params": pain_params,
+        "pain_note": "penalty_pain 이 해당 step 에 반환한 원시 C_pain (가중치·dt 제거, 정상 env 는 0)",
     }
     np.savez_compressed(out_path, **arrays, meta=json.dumps(meta))
 
     sizes = {k: list(v.shape) for k, v in arrays.items()}
-    print(f"[INFO] 저장: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB, "
-          f"{time.time() - t0:.0f}s 소요)")
-    for k in ("obs_policy", "applied_torque_leg", "contact_splint", "gt_L"):
-        print(f"       {k}: {sizes[k]}")
+    log(f"[INFO] 저장: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB, "
+        f"{time.time() - t0:.0f}s 소요)")
+    for k in ("obs_policy", "applied_torque_leg", "contact_splint", "gt_L", "pain"):
+        log(f"       {k}: {sizes[k]}")
     inj = arrays["gt_leg"][-1] >= 0
-    print(f"[INFO] 마지막 스텝 조건: 부상 {int(inj.sum())}/{N} env, "
-          f"L 범위 [{arrays['gt_L'][arrays['gt_L'] > 0].min():.3f}, "
-          f"{arrays['gt_L'].max():.3f}] m")
+    L_inj = arrays["gt_L"][arrays["gt_leg"] >= 0]
+    log(f"[INFO] 마지막 스텝 조건: 부상 {int(inj.sum())}/{N} env, "
+        f"L 범위 [{L_inj.min():.3f}, {L_inj.max():.3f}] m")
+    if pain_idx is not None:
+        p_inj = arrays["pain"][arrays["gt_leg"] >= 0]
+        log(f"[INFO] C_pain (부상 env·step): mean={p_inj.mean():.4f}, "
+            f"P(>0)={(p_inj > 0).mean():.3f}, max={p_inj.max():.2f}")
 
     env.close()
 
@@ -285,15 +287,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
 if __name__ == "__main__":
     # simulation_app.close() 는 종료 시 세그폴트로 원래 예외를 삼킬 수 있어
     # (실측) 다른 test 스크립트처럼 traceback 출력 후 os._exit 로 끝낸다.
-    import os
-    import traceback
-
+    code = 0
     try:
         main()
     except BaseException:
         traceback.print_exc()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
+        code = 1
     sys.stdout.flush()
-    os._exit(0)
+    sys.stderr.flush()
+    os._exit(code)

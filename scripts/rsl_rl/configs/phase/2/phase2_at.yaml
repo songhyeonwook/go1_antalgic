@@ -5,7 +5,7 @@ train:
   agent: rsl_rl_phase2_cfg_entry_point
 
   num_envs: 2048
-  max_iterations: 6000 # 8000, 500
+  max_iterations: 5000 # 8000, 500
   normalize: false
   seed: 42
 
@@ -13,7 +13,7 @@ train:
     
 checkpoint:
   mode: "warmstart" # warmstart, resume
-  teacher: "/home/robotserver/wj/go1_antalgic/scripts/rsl_rl/logs/unitree_go1_antalgic/2026_09_03_16_34_40_phase1_s42_P1-001/model_4999.pt"
+  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P1/model_2999.pt"
   student: ""
   load_optimizer: false # false, true
   reset_iteration: false 

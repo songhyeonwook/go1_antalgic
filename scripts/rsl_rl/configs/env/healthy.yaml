@@ -55,11 +55,11 @@ simulation:
 # 속도 명령 범위
 command:
   linear_velocity_x:
-    min: 0.10                     # 전진 최소 속도 [m/s]
-    max: 1.0                    # 전진 최대 속도 [m/s]
+    min: -1.0                     # 후진 최대 속도 [m/s]
+    max: 1.0                      # 전진 최대 속도 [m/s]
 
-  linear_velocity_y_abs: 0.3      # 좌우 속도 범위 [-값, +값]
-  angular_velocity_yaw_abs: 0.4  # 회전 속도 범위 [-값, +값]
+  linear_velocity_y_abs: 1.0      # 좌우 속도 범위 [-값, +값]
+  angular_velocity_yaw_abs: 1.0   # 회전 속도 범위 [-값, +값]
 
 
 # Observation 설정
@@ -128,8 +128,8 @@ reward:
 
   energy:    
     # 이미 Isaac Lab에 존재하는 페널티의 가중치를 배율로 조정
-    # ex # Isaac Lab 기본 -0.0002 × 30 = 실제 최종 -0.006
-    torque_penalty_scale: 20 # 관절 토크가 클수록 페널티가 커짐
+    # ex # Isaac Lab 기본 -0.0002 × 5 = 실제 최종 -0.001
+    torque_penalty_scale: 5 # 관절 토크가 클수록 페널티가 커짐 (Go1 기본의 5배, 최종 -0.001)
 
     # Isaac Lab 기본 -2.5e-7 × 0.5 = 실제 최종 -1.25e-7
     dof_acc_penalty_scale: 0.5 # 관절 가속도 페널티
@@ -138,7 +138,7 @@ reward:
     action_rate_penalty_scale: 0.5 # final action rate weight = action_rate_weight *action_rate_penalty_scale 
 
   posture:
-    flat_orientation_weight: -2.0 # 몸통이 수평에서 벗어나는 것을 벌점
+    flat_orientation_weight: 0.0 # 좌우 기울기를 벌하지 않고 허용 (창발적 antalgic 보행 관찰용)
     base_height_target: 0.27 # 로봇 몸통이 유지해야 할 목표 높이 (목표값임 보상아님)
     # base_height_weight: -40 # -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
     base_height_weight: -0.15 # 실제 몸통 높이가 목표 높이에서 벗어나는 것을 벌점
@@ -150,7 +150,7 @@ reward:
   # alive bonus
   survival_bonus:
     enabled: true
-    weight: 1.0 # 로봇이 종료되지 않고 한 step을 버틸 때마다 주는 생존 보상
+    weight: 0.25 # 로봇이 종료되지 않고 한 step을 버틸 때마다 주는 생존 보상
 
   joint_mirror_symmetry:
     enabled: false

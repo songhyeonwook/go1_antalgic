@@ -411,46 +411,57 @@ def penalize_diagonal_load_asymmetry(
     return penalty
 
 
+def _body_weight_tensor(env: "ManagerBasedRLEnv", asset_name: str = "robot") -> torch.Tensor:
+    """env 별 로봇 체중 mg [N]. shape: (num_envs,).
+
+    질량 랜덤화(add_base_mass, front_payload)는 startup 이벤트라 학습 중 바뀌지
+    않으므로 처음 한 번 계산해 캐시한다. 부목 링크의 질량 은닉(tiny) 은
+    체중에 무시할 수준이므로 별도 보정하지 않는다.
+    """
+    cached = getattr(env, "_go1_body_weight_n", None)
+    if cached is not None and cached.shape[0] == env.num_envs:
+        return cached
+    robot: Articulation = env.scene[asset_name]
+    masses = robot.root_physx_view.get_masses()  # (num_envs, num_bodies), CPU
+    g = 9.81
+    try:
+        g = abs(float(env.sim.cfg.gravity[2])) or 9.81
+    except Exception:
+        pass
+    mg = (masses.sum(dim=1).to(device=env.device, dtype=torch.float32)) * g
+    env._go1_body_weight_n = mg
+    return mg
+
+
 def penalty_pain(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,
     sensor_name: str = "contact_forces",
-    failure_force_threshold: float = 60.0,
-    pain_scale: float = 0.08,
-    max_exp_argument: float = 8.0,
-    max_penalty: float = 200.0,
-    base_contact_cost: float = 0.0,
-    contact_detect_threshold: float = 1.0,
-
-    base_contact_cost_severe_multiplier: float = 1.0,
-    base_contact_cost_mild_multiplier: float = 1.0,
+    threshold_bw: float = 0.01,
+    scale_bw: float = 0.25,
+    exponent: float = 1.0,
+    splint_transmission: float = 0.5,
     include_calf: bool = True,
-    include_splint: bool = False,
-    splint_attenuation: float = 0.5,
-    severity_scaled: bool = False,
-    severe_splint_length: float = 0.20,
-    mild_splint_length: float = 0.30,
-    threshold_severe_multiplier: float = 0.80,
-    threshold_mild_multiplier: float = 1.15,
-    scale_severe_multiplier: float = 1.25,
-    scale_mild_multiplier: float = 0.85,
+    include_splint: bool = True,
+    body_weight_n: float | None = None,
 ) -> torch.Tensor:
-    """부상 다리 통각(nociceptor) 페널티.
+    """부상 다리 통각(nociceptor) 비용 C_pain ∈ [0, 1].
 
-    통증원 3경로:
-      발 / calf 접촉      — 부상지 직접 접촉 (전달률 1.0, 최악)
-      부목 끝단 접촉 하중  — include_splint=True 일 때. 보조기를 거친 하중도
-        커프 압박·축하중으로 통증을 유발하되 감쇠됨(splint_attenuation).
-        이 항이 없으면 v2 부목 모델에서는 발이 기구적으로 들려 있어 pain 이
-        무의미해지고, 하중 상한이 통각이 아니라 역학으로 결정된다 — antalgic
-        하중 재분배 메커니즘의 핵심이므로 부상 모델에서는 켜야 한다.
+    유효 통증 하중 (eq. fpain):
+      F_pain = F_z^foot + F_z^calf + η · F_z^splint
+        η = splint_transmission ∈ [0, 1] — 부목을 거쳐 부상 조직에 전달되는
+        하중 비율. 부목 모델에서는 발/calf 가 기구적으로 들려 있어
+        F_foot = F_calf = 0 이고 F_pain = η·F_splint 로 환원된다.
 
-    유효 통증 하중:
-      F_pain = F_foot [+ F_calf] [+ splint_attenuation · F_splint]
-      C_pain(F) = P_base·1[contact] + min(expm1(clip(α(F − F_th))), max)
+    통각 비용 (eq. cpain):
+      C_pain = min( ( [F_pain − θ]_+ / ρ )^n , 1 )
+        θ = threshold_bw · mg   (기본 0.01 mg — 무신호 역치)
+        ρ = scale_bw · mg       (기본 mg/4 — 정상 다리 1개의 정적 하중 분담)
+        n = exponent            (기본 1)
+      정규화: 부상 다리가 정상 다리의 정적 하중 분담(mg/4)을 그대로 지면 C_pain = 1.
 
-    nonuse 하한(injured_limb_*)과 이 상한 사이 밴드에서 부목 하중 평형이
-    형성된다 — 하한 < F_th/attenuation 이어야 두 항이 충돌하지 않는다.
+    역치·단조 증가·포화의 세 정성적 성질만 만족하는 최소 스칼라 비용이며,
+    W_pain 과 Δt 는 reward manager (weight · dt) 가 곱한다.
     """
     _ = asset_cfg
     contact_by_foot, _ = _foot_force_tensor(env, sensor_name=sensor_name, use_z_only=True)
@@ -471,223 +482,34 @@ def penalty_pain(
     else:
         contact_by_splint = torch.zeros_like(contact_by_foot)
 
-    peg_leg_idx = _peg_leg_index_per_env(env)
+    if body_weight_n is None:
+        mg = _body_weight_tensor(env)
+    else:
+        mg = torch.full((env.num_envs,), float(body_weight_n), device=env.device)
+    theta = float(threshold_bw) * mg
+    rho = torch.clamp(float(scale_bw) * mg, min=1e-6)
+    n = float(exponent)
+    eta = float(splint_transmission)
 
+    peg_leg_idx = _peg_leg_index_per_env(env)
     penalty = torch.zeros(env.num_envs, device=env.device)
-    threshold = float(failure_force_threshold)
-    scale = float(pain_scale)
-    base_cost = float(base_contact_cost)
-    detect_th = float(contact_detect_threshold)
-    atten = float(splint_attenuation)
 
     for leg in range(4):
         mask = peg_leg_idx == leg
-
         if not mask.any():
             continue
 
-        # 직접 접촉(발/calf)과 보조기 경유(부목) 하중을 분리해 집계
-        direct_force = contact_by_foot[mask, leg] + contact_by_calf[mask, leg]
-        leg_force = direct_force + atten * contact_by_splint[mask, leg]
-
-        if base_cost > 0.0:
-            # 기저 접촉 비용은 '부상 조직의 직접 접촉'에만 — 부목 스탠스에
-            # 매 스텝 과금하면 duty 하한(nonuse)과 반대 방향으로 작용한다.
-            # 부목 하중의 통증은 임계 초과분(아래 exp 항)만 담당.
-            is_contact = (direct_force > detect_th).float()
-
-            penalty[mask] += base_cost * is_contact
-
-        overload = torch.clamp(
-            leg_force - threshold,
-            min=0.0,
+        leg_force = (
+            contact_by_foot[mask, leg]
+            + contact_by_calf[mask, leg]
+            + eta * contact_by_splint[mask, leg]
         )
-
-        exp_arg = torch.clamp(
-            scale * overload,
-            min=0.0,
-            max=float(max_exp_argument),
-        )
-
-        penalty[mask] += torch.clamp(
-            torch.expm1(exp_arg),
-            max=float(max_penalty),
-        )
+        overload = torch.clamp(leg_force - theta[mask], min=0.0) / rho[mask]
+        if n != 1.0:
+            overload = overload.pow(n)
+        penalty[mask] = torch.clamp(overload, max=1.0)
     return penalty
 
-def _injured_ema(
-    env: "ManagerBasedRLEnv",
-    key: str,
-    value: torch.Tensor,
-    ema_alpha: float,
-    peg_leg_idx: torch.Tensor,
-) -> torch.Tensor:
-    """부상 다리 per-env EMA.
-
-    부상 다리 인덱스나 부목 길이 L 이 바뀐 env(= 방금 리셋된 env)만 현재값으로
-    되돌리고 나머지는 계속 누적한다. 상태는 env.<key>_ema / _idx / _L 에 보관.
-    """
-    alpha = float(max(0.0, min(0.9999, ema_alpha)))
-    splint_length = env._peg_leg_splint_length
-    ema = getattr(env, f"{key}_ema", None)
-    prev_idx = getattr(env, f"{key}_idx", None)
-    prev_L = getattr(env, f"{key}_L", None)
-
-    if ema is None or prev_idx is None or prev_L is None:
-        ema = value.detach().clone()
-    else:
-        changed = (prev_idx != peg_leg_idx) | ((prev_L - splint_length).abs() > 1e-4)
-        ema[changed] = value.detach()[changed]
-        ema.mul_(alpha).add_(value.detach(), alpha=1.0 - alpha)
-
-    setattr(env, f"{key}_ema", ema)
-    setattr(env, f"{key}_idx", peg_leg_idx.detach().clone())
-    setattr(env, f"{key}_L", splint_length.detach().clone())
-    return ema
-
-def _splint_severity_alpha(
-    env: "ManagerBasedRLEnv",
-    severe_splint_length: float,
-    mild_splint_length: float,
-) -> torch.Tensor:
-    """Return 0 at severe_splint_length and 1 at mild_splint_length.
-
-    부목 모델 v2 에서는 severe(긴 부목, nominal leg reach 에서 멂)가 mild(짧은
-    부목)보다 수치상 클 수 있으므로 부호 있는 분모로 양방향을 지원합니다.
-    """
-    splint_length = getattr(env, "_peg_leg_splint_length", None)
-    if splint_length is None:
-        return torch.ones(env.num_envs, device=env.device)
-
-    lo = float(severe_splint_length)
-    hi = float(mild_splint_length)
-    denom = hi - lo
-    if abs(denom) < 1e-6:
-        return torch.ones(env.num_envs, device=env.device)
-    return torch.clamp((splint_length.to(env.device) - lo) / denom, min=0.0, max=1.0)
-
-def penalize_injured_limb_force_nonuse(
-    env: "ManagerBasedRLEnv",
-    sensor_name: str = "contact_forces",
-    use_z_only: bool = True,
-    ema_alpha: float = 0.995,
-    force_dynamics: bool = False,
-    force_fixed: float = 5.0,
-    short_splint_length: float = 0.33,
-    short_splint_force: float = 6.0,
-    long_splint_length: float = 0.45,
-    long_splint_force: float = 4.0,
-    front_leg_multiplier: float = 1.15,
-    rear_leg_multiplier: float = 1.0,
-    ramp_start_steps: int = 1000,
-    ramp_duration_steps: int = 8000,
-) -> torch.Tensor:
- 
-    contact_by_leg = _splint_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-    
-    peg_leg_idx = _peg_leg_index_per_env(env)
-
-    injured_force = torch.zeros(env.num_envs, device=env.device)
-    for leg in range(4):
-        mask = peg_leg_idx == leg
-        if mask.any():
-            injured_force[mask] = contact_by_leg[mask, leg]
-
-    ema = _injured_ema(env, "_go1_injured_force", injured_force, ema_alpha, peg_leg_idx)
-
-    if force_dynamics:
-        # 부목 길이 L 을 short_splint_length(=0) ~ long_splint_length(=1) 로
-        # 정규화한 뒤, 두 최소 하중 사이를 그 비율로 섞는다.
-        length_alpha = _splint_severity_alpha(
-            env, short_splint_length, long_splint_length
-        )
-        target = float(short_splint_force) + (
-            float(long_splint_force) - float(short_splint_force)
-        ) * length_alpha
-    else:
-        # 부목 길이와 무관하게 yaml 의 고정값을 모든 env 에 똑같이 채운다.
-        target = torch.full((env.num_envs,), float(force_fixed), device=env.device)
-
-    front_mask = (peg_leg_idx == 0) | (peg_leg_idx == 1)
-    target = torch.where(
-        front_mask,
-        target * float(front_leg_multiplier),
-        target * float(rear_leg_multiplier),
-    )
-
-    is_injured = peg_leg_idx >= 0
-    penalty = torch.zeros(env.num_envs, device=env.device)
-    penalty[is_injured] = torch.clamp(target[is_injured] - ema[is_injured], min=0.0)
-    return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
-    
-
-def penalize_injured_limb_load_duty_nonuse(
-    env: "ManagerBasedRLEnv",
-    sensor_name: str = "contact_forces",
-    load_contact_threshold: float = 10.0,
-    use_z_only: bool = True,
-    ema_alpha: float = 0.995,
-    
-    duty_dynamics: bool = False,            
-    duty_fixed: float = 0.34,               
-    short_splint_length: float = 0.33,      
-    short_splint_duty: float = 0.40,        
-    long_splint_length: float = 0.45,       
-    long_splint_duty: float = 0.28,         
-
-    front_leg_multiplier: float = 1.10,
-    rear_leg_multiplier: float = 1.0,
-    ramp_start_steps: int = 1000,
-    ramp_duration_steps: int = 8000,
-) -> torch.Tensor:
-    """Penalize near-zero load-bearing duty on the injured limb.
-
-    This is a weak regularizer for the analysis metric, not a target gait
-    template. It only activates when the time-averaged load-bearing duty falls
-    below a severity-aware floor.
-
-    부목 모델 v2: 유효 하중 접지는 부목 끝단({leg}_splint) 접촉력으로 판정합니다.
-    """
-    contact_by_splint = _splint_force_tensor(env, sensor_name=sensor_name, use_z_only=use_z_only)
-    peg_leg_idx = _peg_leg_index_per_env(env)
-
-    injured_contact = torch.zeros(env.num_envs, device=env.device)
-    for leg in range(4):
-        mask = peg_leg_idx == leg
-        if mask.any():
-            injured_contact[mask] = (
-                contact_by_splint[mask, leg] > float(load_contact_threshold)
-            ).float()
-            
-    ema = _injured_ema(env, "_go1_injured_load_duty", injured_contact, ema_alpha, peg_leg_idx)
-    
-
-    if duty_dynamics:
-        # 부목 길이 L 을 short_splint_length(=0) ~ long_splint_length(=1) 로
-        # 정규화한 뒤, 두 duty 사이를 그 비율로 섞는다.
-        # env 마다 L 이 다르므로 결과는 env 개수만큼의 벡터가 된다.
-        length_alpha = _splint_severity_alpha(
-            env, short_splint_length, long_splint_length
-        )
-        target = float(short_splint_duty) + (
-            float(long_splint_duty) - float(short_splint_duty)
-        ) * length_alpha
-    else:
-        # 부목 길이와 무관하게 yaml 의 고정값을 모든 env 에 똑같이 채운다.
-        target = torch.full((env.num_envs,), float(duty_fixed), device=env.device)
-
-
-    front_mask = (peg_leg_idx == 0) | (peg_leg_idx == 1)
-    target = torch.where(
-        front_mask,
-        torch.clamp(target * float(front_leg_multiplier), max=0.5),
-        torch.clamp(target * float(rear_leg_multiplier), max=0.5),
-    )        
-
-    is_injured = peg_leg_idx >= 0
-    penalty = torch.zeros(env.num_envs, device=env.device)
-    penalty[is_injured] = torch.clamp(target[is_injured] - ema[is_injured], min=0.0)
-    return penalty * _step_ramp(env, ramp_start_steps, ramp_duration_steps)
 
 def penalize_joint_mirror_asymmetry(
     env: "ManagerBasedRLEnv",

@@ -49,33 +49,6 @@ from .mdp.events import (
     enforce_peg_leg_constraints,
 )
 
-def _validate_dynamics_endpoints(
-    splint_range, short_length: float, long_length: float, where: str
-) -> None:
-    """dynamics 보간 끝점이 실제 부목 길이 샘플 범위 안에 있는지 검사한다.
-
-    끝점이 범위 밖이면 그 바깥 구간이 전부 clamp 되어, 설정한 값이
-    실제로는 도달하지 않거나 보간 폭이 의도보다 좁아진다.
-    """
-    lo, hi = min(splint_range), max(splint_range)
-
-    if not short_length < long_length:
-        raise ValueError(
-            f"{where}: short_splint_length({short_length}) 는 "
-            f"long_splint_length({long_length}) 보다 작아야 합니다."
-        )
-
-    for name, value in (
-        ("short_splint_length", short_length),
-        ("long_splint_length", long_length),
-    ):
-        if not (lo <= value <= hi):
-            raise ValueError(
-                f"{where}.{name}={value} 가 peg_leg.splint_length_range "
-                f"[{lo}, {hi}] 밖입니다 — 그 구간이 전부 clamp 되어 "
-                "보간이 의도대로 작동하지 않습니다."
-            )
-        
 ##
 # Environment configuration
 ##
@@ -535,115 +508,24 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
                 params={
                     "asset_cfg": SceneEntityCfg("robot"),
                     "sensor_name": "contact_forces",
-                    "failure_force_threshold": float(pain_cfg["failure_force_threshold"]),
-                    "pain_scale": float(pain_cfg["pain_scale"]),
-                    
-                    "max_exp_argument": float(pain_cfg["max_exp_argument"]),
-                    "max_penalty": float(pain_cfg["max_penalty"]),
-                    
-                    "base_contact_cost": float(pain_cfg["base_contact_cost"]),
-                    "contact_detect_threshold": float(pain_cfg["contact_detect_threshold"]),
+                    # C_pain = min(([F − θ]_+ / ρ)^n, 1),  θ = threshold_bw·mg, ρ = scale_bw·mg
+                    "threshold_bw": float(pain_cfg["threshold_bw"]),
+                    "scale_bw": float(pain_cfg["scale_bw"]),
+                    "exponent": float(pain_cfg["exponent"]),
                     "include_calf": bool(pain_cfg["include_calf"]),
-                    # 부목을 거친 하중도 (감쇠된) 통증원 — antalgic 상한 형성
+                    # 부목을 거쳐 부상 조직에 전달되는 하중 비율 η — antalgic 상한 형성
                     "include_splint": bool(pain_cfg["include_splint"]),
-                    "splint_attenuation": float(pain_cfg["splint_attenuation"]),
+                    "splint_transmission": float(pain_cfg["splint_transmission"]),
+                    # None 이면 로봇 질량에서 env 별 mg 를 자동 계산
+                    "body_weight_n": (
+                        None if pain_cfg.get("body_weight_n") is None
+                        else float(pain_cfg["body_weight_n"])
+                    ),
                 },
             )
         else:
             self.rewards.penalty_pain = None
 
-        # 부상 다리를 사용하지 않는 것에 대한 패널티 (부목 끝단이 지면에서 받는 힘 측정)
-        force_cfg = cfg["injured_limb_force_nonuse"]
-
-        if force_cfg['enabled']:
-            force_policy_cfg = force_cfg["force_policy"]
-            force_mode = str(force_policy_cfg["mode"]).strip().lower()
-            force_dyn_cfg = force_policy_cfg["dynamics"]
-
-            if force_mode == "dynamics":            
-                _validate_dynamics_endpoints(
-                    peg_leg_cfg["splint_length_range"],
-                    float(force_dyn_cfg["short_splint_length"]),
-                    float(force_dyn_cfg["long_splint_length"]),
-                    "injured_limb_force_nonuse.force_policy.dynamics",
-                )                                      
-
-            self.rewards.injured_limb_force_nonuse = RewTerm(
-                func=mdp.penalize_injured_limb_force_nonuse, # 부상 다리의 평균 접촉력이 최소 목표보다 부족한지를 계산하는 함수
-                weight=float(force_cfg["weight"]),
-                params={
-                    "sensor_name": "contact_forces",
-                    "force_dynamics": force_mode == "dynamics",
-                    "force_fixed": float(force_policy_cfg["fixed"]["value"]),
-                    "short_splint_length": float(force_dyn_cfg["short_splint_length"]),
-                    "short_splint_force": float(force_dyn_cfg["short_splint_force"]),
-                    "long_splint_length": float(force_dyn_cfg["long_splint_length"]),
-                    "long_splint_force": float(force_dyn_cfg["long_splint_force"]),
-
-                    "front_leg_multiplier": float(force_cfg["front_leg_multiplier"]),
-                    "rear_leg_multiplier": float(force_cfg["rear_leg_multiplier"]),    
-                    "ema_alpha": float(force_cfg["ema_alpha"]),
-                    "ramp_start_steps": int(force_cfg["ramp_start_steps"]),
-                    "ramp_duration_steps": int(force_cfg["ramp_duration_steps"]),
-                },
-            )
-        else:
-            self.rewards.injured_limb_force_nonuse = None
-
-        duty_nonuse_cfg = cfg[
-            "injured_limb_load_duty_nonuse"
-        ]
-        
-        # 부상 다리가 일정 시간 동안 하중을 거의 전혀 받지 않는 상태, 즉 부상 다리를 계속 들고 3족 보행하는 것을 막는 페널티
-        if duty_nonuse_cfg["enabled"]:
-
-            duty_policy_cfg = duty_nonuse_cfg["duty_policy"]
-            duty_mode = str(duty_policy_cfg["mode"]).strip().lower()
-            duty_dyn_cfg = duty_policy_cfg["dynamics"]
-
-            if duty_mode == "dynamics":                    
-                _validate_dynamics_endpoints(
-                    peg_leg_cfg["splint_length_range"],
-                    float(duty_dyn_cfg["short_splint_length"]),
-                    float(duty_dyn_cfg["long_splint_length"]),
-                    "injured_limb_load_duty_nonuse.duty_policy.dynamics",
-                )
-        
-            self.rewards.injured_limb_load_duty_nonuse = RewTerm(
-                func=mdp.penalize_injured_limb_load_duty_nonuse,
-                weight=float(duty_nonuse_cfg["weight"]),
-                params={
-                    "sensor_name": "contact_forces",
-                    "load_contact_threshold": float(
-                        duty_nonuse_cfg["load_contact_threshold"]
-                    ),
-
-                    "duty_dynamics": duty_mode == "dynamics",
-                    "duty_fixed": float(duty_policy_cfg["fixed"]["value"]),
-                    "short_splint_length": float(duty_dyn_cfg["short_splint_length"]),
-                    "short_splint_duty": float(duty_dyn_cfg["short_splint_duty"]),
-                    "long_splint_length": float(duty_dyn_cfg["long_splint_length"]),
-                    "long_splint_duty": float(duty_dyn_cfg["long_splint_duty"]),
-
-                    "front_leg_multiplier": float(
-                        duty_nonuse_cfg["front_leg_multiplier"]
-                    ),
-                    "rear_leg_multiplier": float(
-                        duty_nonuse_cfg["rear_leg_multiplier"]
-                    ),
-                    "ema_alpha": float(
-                        duty_nonuse_cfg["ema_alpha"]
-                    ),
-                    "ramp_duration_steps": int(
-                        duty_nonuse_cfg["ramp_duration_steps"]
-                    ),
-                },
-            )
-        else:
-           self.rewards.injured_limb_load_duty_nonuse = None
-
-
-            
     def _apply_reward_settings(self, cfg, peg_leg_cfg) -> None:
         
         task_cfg = cfg["task"]

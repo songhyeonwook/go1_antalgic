@@ -80,7 +80,7 @@ parser.add_argument("--common_config_path", type=str, required=False, default=f"
 parser.add_argument("--log_config_path", type=str, required=False, default=f"{current_file}/configs/logger.yaml" ,help="Path to YAML log config") 
 parser.add_argument("--run_tag", type=str, default="", help="실험 구분 이름. 예: z1_air050")
 parser.add_argument("--debug_obs", action="store_true", help="학습 전 구간의 정책 입력(raw/normalized)과 출력 action 을 CSV 저장 (log_dir/obs_debug/).",)
-parser.add_argument("--debug_obs_envs", type=int, default=4, help="--debug_obs 에서 act() 호출마다 기록할 env 수")
+parser.add_argument("--debug_obs_envs", type=int, default=10, help="--debug_obs 에서 act() 호출마다 기록할 env 수")
 AppLauncher.add_app_launcher_args(parser)
 
 # argparse가 아는 인자와 Hydra 인자를 분리
@@ -198,12 +198,19 @@ def inject_action_std_safety(policy, min_action_std: float) -> None:
             f"got {min_action_std}"
         )
 
-    if not hasattr(policy, "_update_distribution"):       
+    # rsl-rl 3.x 는 public `update_distribution`, 구버전은 `_update_distribution` 을 쓴다.
+    method_name = next(
+        (name for name in ("update_distribution", "_update_distribution")
+         if hasattr(policy, name)),
+        None,
+    )
+
+    if method_name is None:
         raise RuntimeError(
             "update_distribution 계열 메서드를 찾지 못했습니다 — rsl_rl 버전 확인 필요"
         )
-    
-    original_update_distribution = policy._update_distribution
+
+    original_update_distribution = getattr(policy, method_name)
 
     def safe_update_distribution(obs):
         # scalar 방식에서는 원래 distribution을 만들기 전에
@@ -267,7 +274,7 @@ def inject_action_std_safety(policy, min_action_std: float) -> None:
             safe_std,
         )
 
-    policy._update_distribution = (safe_update_distribution)
+    setattr(policy, method_name, safe_update_distribution)
     
 def update_agent_cfg(agent_cfg, config: ExperimentConfig, run_name: str):
     train = config.train

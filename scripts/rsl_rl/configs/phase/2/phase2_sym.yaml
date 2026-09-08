@@ -30,7 +30,7 @@ env:
     name: joint_symmetric
     reward:
       injury:
-        enabled: false          # pain + injured_limb_*_nonuse 비활성
+        enabled: false          # pain 비활성
       joint_mirror_symmetry:
         enabled: true           # ||q − M(q)||² 페널티
         weight: -2.0

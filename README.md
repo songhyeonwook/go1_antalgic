@@ -13,9 +13,10 @@ Built on **NVIDIA Isaac Lab 5.1** + **RSL-RL**, robot **Unitree Go1**.
 ## Method overview
 
 - **Antalgic objective** (`mdp/rewards.py`): `r = W_task·r_track − W_energy·‖τ‖² − W_pain·C_pain`,
-  with a nociceptor-inspired penalty on the affected-limb normal contact force
-  `C_pain(F) = P_base·1_contact + max(0, exp(α(F − F_th)) − 1)` (P_base=0.05, F_th=10 N, α=2.0),
-  under a minimal load-bearing (viability) constraint.
+  with a nociceptor-inspired cost on the affected-limb effective load
+  `F_pain = F_foot + F_calf + η·F_splint`, `C_pain = min(([F_pain − θ]₊/ρ)ⁿ, 1)`
+  (θ = 0.01·mg, ρ = mg/4, n = 1, η = 0.5; C_pain = 1 when the injured limb carries a healthy
+  limb's static share).
 - **Injury model — functional splint** (`mdp/events.py`): the affected knee is
   immobilised at a functional, ground-reaching angle by a stiff joint-level spring
   (not a shortened peg) and action-masked; effective length `L_peg` is randomisable.
@@ -33,7 +34,7 @@ source/go1_lab/                          Isaac Lab extension (the environment + 
   go1_lab/tasks/manager_based/go1_lab/
     go1_lab_env_cfg.py                   env config: obs/reward/termination/DR/curriculum, GO1_* switches
     go1_lab_env.py                       env class (peg-leg action masking, joint locking)
-    mdp/rewards.py                       reward terms incl. nociceptor pain (eq.4) + viability floors
+    mdp/rewards.py                       reward terms incl. nociceptor pain (eq.4)
     mdp/events.py                        injury injection, functional splint, L_peg / DR randomisation, curriculum
     mdp/observations.py                  proprioception + privileged injury observations
     mdp/mirror.py                        left/right mirror transforms (symmetry reward)
@@ -69,7 +70,7 @@ Behaviour is switched via `GO1_*` environment variables (see `go1_lab_env_cfg.py
 # Phase 1 — healthy symmetric pre-training
 ./train_phase1.sh
 
-# Phase 2 — antalgic teacher (functional splint, eq.4 pain, viability floor, PD, DR)
+# Phase 2 — antalgic teacher (functional splint, eq.4 pain, PD, DR)
 #   unified across the four leg locations; wide-speed via the warmstart curriculum
 cd scripts/rsl_rl && bash ./train_uni_curriculum.sh
 

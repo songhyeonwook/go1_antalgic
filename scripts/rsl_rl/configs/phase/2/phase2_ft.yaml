@@ -28,7 +28,7 @@ env:
     name: fault_tolerant
     reward:
       injury:
-        enabled: false   # pain + injured_limb_*_nonuse 전부 비활성
+        enabled: false   # pain 비활성
 
 eval:
   peg_leg: normal

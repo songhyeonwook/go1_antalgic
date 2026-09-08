@@ -6,7 +6,7 @@ train:
   agent: rsl_rl_phase1_cfg_entry_point
   
   num_envs: 2048
-  max_iterations: 5000
+  max_iterations: 3000 #5000
   normalize: false
   seed: 42
 

@@ -25,14 +25,6 @@ checkpoint:
 
 env:
   path: ../../env/antalgic.yaml
-  overrides:
-    reward:
-      injury:
-        injured_limb_force_nonuse:
-          ramp_start_steps: 0
-          ramp_duration_steps: 1
-        injured_limb_load_duty_nonuse:
-          ramp_duration_steps: 1
 
 eval:
   peg_leg: normal

@@ -118,7 +118,7 @@ class Phase3StudentTeacher(StudentTeacherRecurrent):
 
     # forward
     def act(self, obs: TensorDict) -> torch.Tensor:          # rollout: 노이즈 샘플
-        self._update_distribution(self._student_latent(obs))
+        self.update_distribution(self._student_latent(obs))
         return self.distribution.sample() # 실제 환경에 넣을 action을 샘플링
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:  # 배포 / 평가
