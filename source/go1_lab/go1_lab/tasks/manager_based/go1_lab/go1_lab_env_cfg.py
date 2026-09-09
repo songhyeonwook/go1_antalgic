@@ -920,4 +920,3 @@ class Go1LabEnvCfg(UnitreeGo1RoughEnvCfg):
         
         self._apply_reward_settings(settings["reward"], settings['peg_leg'])
         self._apply_termination_settings(settings["termination"])
-    

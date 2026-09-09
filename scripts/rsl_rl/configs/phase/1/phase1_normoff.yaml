@@ -6,10 +6,10 @@ train:
   agent: rsl_rl_phase1_cfg_entry_point
   
   num_envs: 2048
-  max_iterations: 3000 #5000
+  max_iterations: 5000
 
   normalize: 
-    enable: true
+    enable: false
     
     obs:
       # mean: [0.01, 0.0, 0.01], std: [0.58, 0.35, 0.25], max: [10.72, 4.26, 2.75], min: [-10.56, -3.82, -2.86]
