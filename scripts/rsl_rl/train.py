@@ -175,7 +175,7 @@ import isaaclab_tasks  # noqa: F401
 import go1_lab.tasks  # noqa: F401
 
 from go1_lab.tasks.manager_based.go1_lab.mdp.obs_normalizer import (
-    command_scale_from_cfg, install_obs_normalizer,
+    install_obs_scaler, obs_scale_summary,
 )
 from utils.obs_debug_dump import ObsDebugDumper
 
@@ -324,6 +324,7 @@ def update_env_cfg(env_cfg, config: ExperimentConfig, log_dir: str, steps_per_it
 
     return env_cfg
 
+
 @hydra_task_config(
     config.train.task,
     config.train.agent,
@@ -369,16 +370,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if config.phase == "phase3":
         app_logger.info("Output norm (train.mse_norm): %s", runner.alg.policy.output_norm_summary())
 
-    replaced = install_obs_normalizer(
-        runner.alg.policy,
-        command_scale_from_cfg(config.environment.values["command"]),
-        env.get_observations(),
-        enabled=config.train.normalize,
-    )
-    app_logger.info(
-            "Obs normalizer: %s",
-            ", ".join(replaced) if replaced else "disabled — raw obs",   # ← 수정
+    nm = config.train.normalize
+    if nm.enable:
+        replaced = install_obs_scaler(runner.alg.policy, env.get_observations(), nm.obs, nm.priv)
+        app_logger.info(
+            "Obs scale (train.normalize): enabled — %s | obs %s, priv %s",
+            ", ".join(replaced), nm.obs, nm.priv,
         )
+    else:
+        app_logger.info("Obs scale (train.normalize): disabled — raw obs")
         
     # 체크포인트
     mode = checkpoint_cfg.mode.strip().lower()
@@ -394,18 +394,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
 
         checkpoint_path = checkpoint_cfg.teacher.strip()
-        
         runner.load(
             checkpoint_path,
             load_optimizer=checkpoint_cfg.load_optimizer,
         )
 
         if mode in ("warmstart", "distill"):
-            for role in ("actor", "critic", "student", "teacher"):
-                nz = getattr(runner.alg.policy, f"{role}_obs_normalizer", None)
-                if hasattr(nz, "reset_count"):
-                    nz.reset_count()
-
             # ── 탐색 노이즈 재설정 ────────────────────────────────────
             # log_std / std 는 nn.Parameter 라 runner.load() 가 체크포인트 값으로
             # 덮어쓴다. 그래서 yaml 의 init_noise_std 는 warmstart 에서 그냥 무시된다.
@@ -440,8 +434,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif checkpoint_cfg.reset_iteration:
             runner.current_learning_iteration = 0
                 
-    
     inject_action_std_safety(runner.alg.policy, min_action_std=(config.exploration.min_action_std),)
+    app_logger.info("Obs scale (실제 적용): %s", obs_scale_summary(runner.alg.policy))
 
     app_logger.info(
         "PPO exploration: "

@@ -4,6 +4,18 @@ from typing import Any
 
 import yaml
 
+
+_OBS_SCALE_KEYS = ("angular_vel", "gravity", "cmd_vel", "joint_pos", "joint_vel", "action")
+_PRIV_SCALE_KEYS = ("splint_length", "linear_vel")
+
+
+@dataclass
+class NormalizeConfig:
+    """관측 스케일링 (train.normalize). x * scale 만 하고 평균은 빼지 않는다."""
+    enable: bool = False
+    obs: dict[str, float] | None = None    # 로더가 전 키를 채운다
+    priv: dict[str, float] | None = None
+    
 @dataclass
 class MseNormConfig:
     """phase 3 출력 정규화 상수 (train.mse_norm). compute_output_norm.py 가 만든 mse_norm.yaml 값을 넣는다."""
@@ -35,7 +47,7 @@ class TrainConfig:
     max_iterations: int | None
     seed: int
     num_steps_per_env: int  
-    normalize: bool = False 
+    normalize: NormalizeConfig | None = None
     gradient_length: int | None = None # For phase3
     splint_loss_coef: float | None = None # For phase3
     vel_loss_coef: float | None = None # For phase3
@@ -65,7 +77,9 @@ class ExperimentConfig:
     evaluation: EvaluationConfig
     exploration: ExplorationConfig
     rsl_logger: str = "tensorboard"
-    
+
+
+
 def deep_merge(base: dict, overrides: dict) -> dict:
     for key, value in overrides.items():
         if (
@@ -179,9 +193,12 @@ def load_experiment_config(phase_path: str, common_path: str) -> ExperimentConfi
     # train
     train_raw = dict(phase_cfg["train"])
     mse_norm_cfg = load_mse_norm_config(train_raw)   # train.mse_norm 검증 (enable 이면 std > 0, 길이 12 / 3)
-    train_raw.pop("mse_norm", None)
+    normalize_cfg = load_normalize_config(train_raw)
 
-    train_cfg = TrainConfig(**train_raw, mse_norm=mse_norm_cfg)
+    train_raw.pop("mse_norm", None)
+    train_raw.pop("normalize", None)
+
+    train_cfg = TrainConfig(**train_raw, mse_norm=mse_norm_cfg, normalize=normalize_cfg)
     checkpoint_cfg = CheckpointConfig(**phase_cfg["checkpoint"])
     
     # evaluation
@@ -277,4 +294,42 @@ def load_mse_norm_config(train_raw: dict) -> MseNormConfig | None:
             )
         setattr(cfg, name, v)
     cfg.splint_mean = float(cfg.splint_mean)
+    return cfg
+
+def load_normalize_config(train_raw: dict) -> NormalizeConfig:
+    raw = train_raw.get("normalize")
+    if raw is None:
+        return NormalizeConfig()  
+    if isinstance(raw, bool):
+        # 구버전 yaml (normalize: false). 새 블록 형식으로 바꿔야 한다.
+        raise TypeError(
+            "train.normalize 가 bool 입니다. running RMS 스위치는 스케일 블록으로 대체되었습니다. "
+            "enable / obs / priv 형식으로 바꾸세요."
+        )
+    if not isinstance(raw, dict):
+        raise TypeError("train.normalize 는 딕셔너리여야 합니다")
+
+    cfg = NormalizeConfig(enable=bool(raw.get("enable", False)))
+    for group_key, valid in (("obs", _OBS_SCALE_KEYS), ("priv", _PRIV_SCALE_KEYS)):
+        entries = raw.get(group_key) or {}
+        if not isinstance(entries, dict):
+            raise TypeError(f"train.normalize.{group_key} 는 딕셔너리여야 합니다")
+
+        unknown = set(entries) - set(valid)
+        if unknown:
+            # 오타를 조용히 무시하면 스케일이 빠진 채로 학습된다
+            raise ValueError(
+                f"train.normalize.{group_key} 에 모르는 키: {sorted(unknown)}. "
+                f"사용 가능: {sorted(valid)}"
+            )
+
+        resolved = {}
+        for key in valid:
+            value = float(entries.get(key, 1.0))    # 빠진 키는 1.0 (스케일 없음)
+            if not value > 0.0:
+                raise ValueError(
+                    f"train.normalize.{group_key}.{key} 는 0 보다 커야 합니다 (현재 {value})"
+                )
+            resolved[key] = value
+        setattr(cfg, group_key, resolved)
     return cfg

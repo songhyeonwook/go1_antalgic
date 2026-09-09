@@ -233,23 +233,17 @@ def make_policy(env, agent_cfg, config: ExperimentConfig, checkpoint, device: st
     train.py 와 같은 규약으로 끼워 넣는다 (normalize: false 면 아무것도 안 한다).
     runner 클래스는 agent cfg 의 class_name 으로 고른다 (OnPolicyRunner / Phase3DistillationRunner).
     """
-    from go1_lab.tasks.manager_based.go1_lab.mdp.obs_normalizer import (
-        command_scale_from_cfg, install_obs_normalizer,
-    )
+    from go1_lab.tasks.manager_based.go1_lab.mdp.obs_normalizer import install_obs_scaler
 
     from .rsl_rl_compat import resolve_runner_class
 
     runner_cls = resolve_runner_class(agent_cfg.class_name)
     runner = runner_cls(env=env, train_cfg=agent_cfg.to_dict(), log_dir=None, device=device)
-    replaced = install_obs_normalizer(
-        runner.alg.policy,
-        command_scale_from_cfg(config.environment.values["command"]),
-        env.get_observations(),
-        enabled=config.train.normalize,
-    )
+    nm = config.train.normalize
+    replaced = install_obs_scaler(runner.alg.policy, env.get_observations(), nm.obs, nm.priv) if nm.enable else []
     runner.load(str(checkpoint), load_optimizer=False, map_location=device)
+    log(f"[eval] Obs scale     : {', '.join(replaced) if replaced else 'disabled — raw obs'}")
     policy_fn = runner.get_inference_policy(device=env.unwrapped.device)
-    log(f"[eval] Obs normalizer : {', '.join(replaced) if replaced else 'disabled — raw obs'}")
     return runner, policy_fn, runner.alg.policy
 
 

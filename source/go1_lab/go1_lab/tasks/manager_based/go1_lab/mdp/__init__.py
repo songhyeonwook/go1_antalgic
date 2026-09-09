@@ -11,4 +11,4 @@ from . import events  # noqa: F401, F403
 from .events import enforce_peg_leg_constraints  # noqa: F401
 from .observations import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
-from .obs_normalizer import ObsGroupNormalizer, command_scale_from_cfg, install_obs_normalizer  # noqa: F401
+from .obs_normalizer import ObsScaler, build_obs_scale, install_obs_scaler  # noqa: F401

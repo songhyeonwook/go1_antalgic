@@ -1,10 +1,13 @@
-train:
-  project_name: unitree_go1_antalgic
-  task: Template-Go1-Lab-v0
-  agent: rsl_rl_phase3_cfg_entry_point
+# cd /home/robotserver/wj/go1_antalgic/scripts/rsl_rl && nohup /home/robotserver/wj/.venvs/isaaclab-5.1-antalgic/bin/python train.py --phase_config_path configs/phase/1/phase1.yaml --run_tag P1-001 --headless --debug_obs --debug_obs_envs 10 > logs/p1_001.out 2>&1 &
 
+train:
+  project_name: unitree_go1_antalgic 
+  task: Template-Go1-Lab-v0
+  agent: rsl_rl_phase1_cfg_entry_point
+  
   num_envs: 2048
-  max_iterations: 4000 # 8000, 500
+  max_iterations: 5000
+
   normalize: 
     enable: false
     
@@ -30,42 +33,29 @@ train:
     priv:
       splint_length: 1
       linear_vel: 1
-  mse_norm: 
-    enable: true
+  
 
-    action_mean: 0.0
-    action_pstd: 0.0
-
-    splint_mean: 0.0
-    splint_std: 0.0
-
-    vel_mean: 0.0
-    vel_pstd: 0.0
 
   seed: 42
 
-  num_steps_per_env: 50
-  gradient_length: 50
+  num_steps_per_env: 24
 
-  splint_loss_coef: 1.0
-  vel_loss_coef: 1.0
-  
 checkpoint:
-  mode: "distill" # warmstart, resume
-  # Phase 2 teacher (부목 모델 v2)
-  teacher: ""
-  student: ""
-  load_optimizer: false # false, true
+  mode: scratch
+  teacher: 
+  student: 
+  load_optimizer: false 
   reset_iteration: true
-  reset_noise_std: false    # warmstart 시 init_noise_std 로 std 를 되돌린다
-
 
 env:
-  path: ../../env/antalgic.yaml
- 
-eval:
-  peg_leg: normal # normal, fl, fr, rl, rr
+  path: ../../env/healthy.yaml
 
+
+eval:
+  peg_leg: normal 
+
+
+# 덮어씌우는 부분 기능 수정
 exploration:
   noise_std:
     # 실제 사용할 탐색 노이즈 방식
@@ -77,5 +67,7 @@ exploration:
         min_action_std: 0.001
 
       log:
-        init_noise_std: 0.05
+        init_noise_std: 1.0
         min_action_std: 0.001
+
+overrides: {}
