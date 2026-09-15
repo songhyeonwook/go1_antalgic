@@ -65,7 +65,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="부목 길이 [m]. 값 1개면 고정, 2개면 균등 범위. 미지정 시 yaml",
     )
     parser.add_argument(
-        "--clean", action="store_true", help="마찰·질량 랜덤화, push, 관측 노이즈를 끄고 평가",
+        "--clean", action="store_true",
+        help="무작위성 제거: 바닥 마찰·몸통 질량 랜덤화, push, 관측 노이즈를 끄고 부목 끝단 마찰을 "
+             "범위 중앙값으로 고정. 고정 payload/CoM 은 로봇 사양이므로 유지",
     )
 
 
@@ -154,10 +156,10 @@ def build_env_cfg(
     peg_event = env_cfg.events.randomize_peg_leg_actuation
     if peg_event is not None:
         # 학습 yaml 의 조건 비율 대신 평가 조건을 강제한다. env_fixed 배정이라
-        # 리셋해도 조건이 바뀌지 않고 env_id 순서대로 블록이 잡힌다.
+        # 학습 때 사용했던 부상 비율을 무시하고 평가용 비율로 바꿈
         peg_event.params["leg_ratios"] = EVAL_LEG_RATIOS[eval_mode]
-        peg_event.params["leg_deterministic"] = True
-        if splint_length is not None:
+        peg_event.params["leg_deterministic"] = True # 어떤 env가 어떤 부상 조건인지 고정합니다.
+        if splint_length is not None: # 부목길이를 지정한 경우
             from go1_lab.splint import SPLINT_MAX, SPLINT_MIN
 
             lo, hi = float(min(splint_length)), float(max(splint_length))
@@ -169,12 +171,18 @@ def build_env_cfg(
             peg_event.params["splint_length_range"] = (lo, hi)
     elif splint_length is not None:
         raise ValueError("--splint_length 는 peg_leg.enabled=true 인 env 에서만 쓸 수 있습니다.")
-
+    # clean은 학습 중 사용한 외란과 센서 노이즈를 제거하여 깨끗한 조건에서 평가한다는 뜻입니다.
     if clean:
+        # 무작위성만 끈다. front_payload_* 는 랜덤이 아니라 고정 오프셋(로봇 사양)이라 유지한다.
         for name in ("physics_material", "add_base_mass", "push_robot"):
             if getattr(env_cfg.events, name, None) is not None:
                 setattr(env_cfg.events, name, None)
-        env_cfg.observations.policy.enable_corruption = False
+        # 부목 끝단 마찰도 에피소드마다 뽑히므로 범위 중앙값으로 고정한다.
+        if peg_event is not None:
+            lo, hi = peg_event.params["foot_friction_range"]
+            mid = 0.5 * (float(lo) + float(hi))
+            peg_event.params["foot_friction_range"] = (mid, mid)
+        env_cfg.observations.policy.enable_corruption = False # 센서 observation noise 끔
     return env_cfg
 
 
@@ -202,8 +210,8 @@ def build_agent_cfg(config: ExperimentConfig, *, seed: int, device: str):
     agent_cfg = load_cfg_from_registry(config.train.task, config.train.agent)
     agent_cfg.seed = int(seed)
     agent_cfg.device = device
-    agent_cfg.policy.noise_std_type = config.exploration.noise_std_type
-    agent_cfg.policy.init_noise_std = config.exploration.init_noise_std
+    # agent_cfg.policy.noise_std_type = config.exploration.noise_std_type # Noise를 주지 않는다.
+    # agent_cfg.policy.init_noise_std = config.exploration.init_noise_std
     return agent_cfg
 
 

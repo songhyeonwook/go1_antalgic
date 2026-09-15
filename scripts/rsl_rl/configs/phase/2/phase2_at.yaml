@@ -33,7 +33,6 @@ train:
       linear_vel: 1
     
   seed: 42
-
   num_steps_per_env: 24
     
 checkpoint:

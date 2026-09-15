@@ -8,11 +8,18 @@
 정규화가 실제로 어떤 값을 정책에 흘려보내는지, 그 분포가 학습 내내 어떻게
 변하는지 보기 위한 것이다. 학습이 끝날 때까지 매 act() 호출마다 기록한다.
 
-    <out_dir>/obs_raw.csv    정규화 '이전' 관측
-    <out_dir>/obs_norm.csv   정규화 '이후' 관측 — 정책 첫 층이 실제로 받는 값
-    <out_dir>/action.csv     그 입력으로 정책이 낸 action (탐색 노이즈 포함 샘플)
+    <out_dir>/obs_raw.csv     정규화 '이전' 관측
+    <out_dir>/obs_norm.csv    정규화 '이후' 관측 — 정책 첫 층이 실제로 받는 값
+    <out_dir>/action.csv      그 입력으로 정책이 낸 action (탐색 노이즈 포함 샘플)
+    <out_dir>/action_raw.csv  같은 입력의 결정론적 평균 mu(s) (탐색 노이즈 이전)
 
 파일들은 같은 (step, env_id) 행 순서라 행 단위로 서로 대응된다.
+
+두 action 파일의 관계는 a = mu(s) + sigma ⊙ eps 다. 환경에 실제로 들어가고 다음
+스텝 관측의 act_* 열로 되돌아오는 것은 action.csv 쪽이고, action_raw.csv 는
+phase-3 의 BC target 과 같은 결정론적 출력이다. 그래서 통계(정규화 상수)는
+action_raw.csv 에서 뽑되, 덤프 무결성 검증(action(t) == obs.act(t+1))은
+반드시 action.csv 로 해야 한다.
 
 yaml 의 normalize 가 false 면 정규화기 자리에 rsl_rl 의 nn.Identity 가 남고
 훅의 output 이 입력 텐서 그 자체라 obs_norm.csv 가 obs_raw.csv 의 완전한 사본이
@@ -29,6 +36,7 @@ yaml 의 normalize 가 false 면 정규화기 자리에 rsl_rl 의 nn.Identity �
                   64   7,680,000          9.3 GB
                 2048 245,760,000        298.8 GB   ← 디스크가 감당 못 한다
 
+   action_raw.csv 가 더해지면 여기에 약 11% 가 붙는다 (행당 ~132 B).
    그래서 기본값은 4 이고, 시작할 때 예상 용량과 남은 디스크를 함께 찍는다.
    여유보다 크면 경고만 하고 계속 진행하니 필요하면 중단하면 된다.
 
@@ -66,7 +74,8 @@ _POLICY_COLUMNS = (
 # (teacher PPO 라 privileged 를 본다). phase 3 student 는 policy 49 만 받는다.
 _PRIVILEGED_COLUMNS = ["splint_L", "lin_vel_x", "lin_vel_y", "lin_vel_z"]
 
-_ACTION_COLUMNS = [f"a_{j}" for j in _JOINTS]  # 12
+_ACTION_COLUMNS = [f"a_{j}" for j in _JOINTS]    # 12  노이즈 포함 샘플
+_MU_COLUMNS = [f"mu_{j}" for j in _JOINTS]       # 12  노이즈 이전 평균 mu(s)
 
 # 관측의 jpos_calf_* 는 default_joint_pos 기준 '상대각'이라 부목으로 잠긴
 # calf 의 실제 접힌 각도를 알 수 없다. 시뮬레이터에서 절대각을 직접 읽는다.
@@ -89,6 +98,12 @@ def _action_columns(width: int) -> list[str]:
     if width == len(_ACTION_COLUMNS):
         return list(_ACTION_COLUMNS)
     return [f"a{i}" for i in range(width)]
+
+
+def _mu_columns(width: int) -> list[str]:
+    if width == len(_MU_COLUMNS):
+        return list(_MU_COLUMNS)
+    return [f"mu{i}" for i in range(width)]
 
 
 def _human(num_bytes: float) -> str:
@@ -163,10 +178,20 @@ class ObsDebugDumper:
         # output 이 입력 텐서 그 자체라 obs_norm.csv 가 obs_raw.csv 의 완전한
         # 사본이 된다. 그 경우 파일을 아예 만들지 않는다.
         self._has_norm = not isinstance(self._norm_module, torch.nn.Identity)
+
+        # rsl_rl 정책(ActorCritic / StudentTeacher)은 __init__ 에서
+        # self.distribution = None 을 잡아두고 act() 안의 _update_distribution 에서
+        # Normal(mean, std) 로 채운다. 그 mean 이 곧 노이즈 이전 mu(s) 다.
+        self._has_mu = hasattr(policy, "distribution")
+        if not self._has_mu:
+            self._log("[obs-debug] 정책에 distribution 이 없어 action_raw.csv 를 생략합니다")
+
         self._names = (
             ("obs_raw", "obs_norm", "action") if self._has_norm
             else ("obs_raw", "action")
         )
+        if self._has_mu:
+            self._names = self._names + ("action_raw",)
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         for name in self._names:
@@ -200,7 +225,8 @@ class ObsDebugDumper:
         rows = total_calls * per_step
         # 값 하나가 대략 10바이트 + step/env_id 12바이트
         obs_files = 2 if self._has_norm else 1
-        approx = rows * ((53 * 10 + 12) * obs_files + (12 * 10 + 12))
+        act_files = 2 if self._has_mu else 1
+        approx = rows * ((53 * 10 + 12) * obs_files + (12 * 10 + 12) * act_files)
         free = shutil.disk_usage(self.out_dir).free
         note = "" if approx < free * 0.8 else "   ⚠️ 남은 디스크에 비해 큽니다"
         self._log(
@@ -222,6 +248,8 @@ class ObsDebugDumper:
         if self._has_norm:
             self._writers["obs_norm"].writerow(base)
         self._writers["action"].writerow(["step", "env_id"] + _action_columns(act_width))
+        if self._has_mu:
+            self._writers["action_raw"].writerow(["step", "env_id"] + _mu_columns(act_width))
 
     def _select_envs(self, num_envs: int, device):
         """기록할 env 인덱스를 전 구간에 고르게 퍼뜨린다.
@@ -258,6 +286,14 @@ class ObsDebugDumper:
             writer.writerow([step, self._env_ids[i]] + cells)
 
     def _wrapped_act(self, obs, **kwargs):
+        # act() 가 distribution 을 반드시 새로 채우게 강제한다. 이 한 줄이 없으면
+        # 어떤 이유로든 _update_distribution 을 타지 않는 경로가 생겼을 때 직전
+        # 호출의 mu 가 조용히 한 번 더 기록된다 (틀린 값인데 티가 나지 않는다).
+        # act() 직후 PPO 가 get_actions_log_prob / action_mean 으로 distribution 을
+        # 다시 읽지만, act() 가 항상 새로 채우므로 미리 비워 두는 것은 안전하다.
+        if self._has_mu:
+            self.policy.distribution = None
+
         actions = self._orig_act(obs, **kwargs)
 
         # ── rollout 호출만 기록한다 ──────────────────────────────────────
@@ -283,6 +319,20 @@ class ObsDebugDumper:
         raw_b = raw[sel].detach().float().cpu().numpy()
         act_b = actions[sel].detach().float().cpu().numpy()
 
+        # 노이즈 이전 mu(s). act() 안에서 이미 계산된 텐서라 추가 forward 가 없다.
+        # act_inference() 를 다시 부르면 안 된다 — recurrent student 는 LSTM hidden
+        # state 가 한 칸 더 전진해 학습 궤적이 달라진다.
+        mu_b = None
+        if self._has_mu:
+            dist = self.policy.distribution
+            if dist is None or dist.mean.shape != actions.shape:
+                raise RuntimeError(
+                    "act() 후 distribution.mean 을 읽지 못했습니다 "
+                    f"(distribution={type(dist).__name__}). "
+                    "이 정책으로는 action_raw.csv 를 만들 수 없습니다."
+                )
+            mu_b = dist.mean[sel].detach().float().cpu().numpy()
+
         calf_b = None
         if self._calf_ids is not None:
             joint_pos = self.env.unwrapped.scene["robot"].data.joint_pos
@@ -293,6 +343,8 @@ class ObsDebugDumper:
         if self._has_norm:
             self._write_block("obs_norm", norm[sel].detach().float().cpu().numpy())
         self._write_block("action", act_b)
+        if mu_b is not None:
+            self._write_block("action_raw", mu_b)
 
         self._rows += len(self._env_ids)
         self._call += 1

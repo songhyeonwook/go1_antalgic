@@ -75,3 +75,15 @@ core.*
 .env.*
 !.env.example
 .secrets/
+# Claude Code session dirs / scratch
+.claude/
+temp/
+nohup.out
+nohup*.out
+
+# chain runner: per-run generated yamls (configs/chain/<NAME>/{1,2,3}/phaseN.yaml).
+# gen_cfg.py / run_chain.sh 자체는 추적한다. 통째로 무시하려면 아래를 scripts/rsl_rl/configs/chain/ 로 바꾼다.
+scripts/rsl_rl/configs/chain/*/
+
+# editor-made duplicate configs ("xxx copy.yaml")
+* copy.yaml
