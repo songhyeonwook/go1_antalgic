@@ -6,7 +6,7 @@ train:
   num_envs: 2048
   max_iterations: 4000 # 8000, 500
   normalize: 
-    enable: false
+    enable: true
     
     obs:
       # mean: [0.01, 0.0, 0.01], std: [0.58, 0.35, 0.25], max: [10.72, 4.26, 2.75], min: [-10.56, -3.82, -2.86]
@@ -30,18 +30,21 @@ train:
     priv:
       splint_length: 1
       linear_vel: 1
-  mse_norm: 
+  # 출력 정규화 상수. compute_output_norm.py 가 생성 — 손으로 고치지 말고 다시 생성할 것.
+  #   source   : P2_at_dbg
+  #   generated: 2026-09-13 14:26   rows 1,200,000   action tail 20%   noise model_7998.pt [log_std]
+  #   z = (y - mean) / std.  mean 은 차원별, std 는 head 당 pooled 하나 = sqrt(mean_j Var_j)
+  mse_norm:
     enable: true
 
-    action_mean: 0.0
-    action_pstd: 0.0
+    action_mean: [-0.867, 0.887, -0.972, 1.043, -0.996, -0.972, -0.548, -0.731, 2.245, 2.127, 1.629, 1.769]   # 관절 순서 hip FL FR RL RR, thigh FL FR RL RR, calf FL FR RL RR
+    action_pstd: 0.7827                   # 12관절 pooled, 탐색 노이즈 분산 제거 (정상 0.594 / 부상 0.898)
 
-    splint_mean: 0.0
-    splint_std: 0.0
+    splint_mean: 0.3501                    # 부상 env 만 [m]
+    splint_std: 0.0286
 
-    vel_mean: 0.0
-    vel_pstd: 0.0
-
+    vel_mean: [0.0009, -0.0034, 0.0097]          # 축 순서 x y z [m/s]
+    vel_pstd: 0.4528                      # 3축 pooled (축별 [0.556, 0.543, 0.103])
   seed: 42
 
   num_steps_per_env: 50
@@ -53,7 +56,7 @@ train:
 checkpoint:
   mode: "distill" # warmstart, resume
   # Phase 2 teacher (부목 모델 v2)
-  teacher: ""
+  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P2_at_dbg/model_7998.pt"
   student: ""
   load_optimizer: false # false, true
   reset_iteration: true

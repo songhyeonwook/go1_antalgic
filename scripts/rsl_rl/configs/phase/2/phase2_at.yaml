@@ -7,7 +7,7 @@ train:
   num_envs: 2048
   max_iterations: 5000 # 8000, 500
   normalize: 
-    enable: false
+    enable: true
     
     obs:
       # mean: [0.01, 0.0, 0.01], std: [0.58, 0.35, 0.25], max: [10.72, 4.26, 2.75], min: [-10.56, -3.82, -2.86]
@@ -37,7 +37,7 @@ train:
     
 checkpoint:
   mode: "warmstart" # warmstart, resume
-  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P1/model_2999.pt"
+  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P1-final/model_2999.pt"
   student: ""
   load_optimizer: false # false, true
   reset_iteration: false 
