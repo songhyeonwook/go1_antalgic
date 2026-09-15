@@ -268,20 +268,20 @@ def summarize(rec, settle_s: float = 2.0, min_stance_s: float = 0.06):
         n = int(m.sum())
         if n == 0:
             continue
-        duty = [float(contact[..., k][m].mean()) for k in range(4)]
+        ms = m & settled                        # 상태 기반 지표는 리셋 후 settle_s 이후 샘플만
+        duty = [float(contact[..., k][ms].mean()) if ms.any() else float("nan") for k in range(4)]
         force = []
         for k in range(4):
-            c = contact[..., k] & m
+            c = contact[..., k] & ms
             force.append(float(rec["force"][..., k][c].mean()) if c.any() else 0.0)
         row = {
-            "group": CONDITION_LABELS[g], "samples": n,
+            "group": CONDITION_LABELS[g], "samples": n, "samples_settled": int(ms.sum()),
             **{f"duty_{leg}": duty[k] for k, leg in enumerate(LEGS)},
             **{f"force_{leg}": force[k] for k, leg in enumerate(LEGS)},
-            "vel_err_xy": float(rec["verr"][m].mean()),
-            "yaw_err": float(rec["werr"][m].mean()),
-            "falls_per_min": float(rec["fall"][m].sum() / (n * dt / 60.0)),
+            "vel_err_xy": _nanmean(rec["verr"][ms]),
+            "yaw_err": _nanmean(rec["werr"][ms]),
+            "falls_per_min": float(rec["fall"][m].sum() / (n * dt / 60.0)),   # 낙상은 전 구간
         }
-        ms = m & settled
         n_to, n_fall = int(rec["timeout"][m].sum()), int(rec["fall"][m].sum())
         row["episodes"] = n_to + n_fall
         row["survival_pct"] = float(100.0 * n_to / (n_to + n_fall)) if (n_to + n_fall) else float("nan")
@@ -303,12 +303,12 @@ def summarize(rec, settle_s: float = 2.0, min_stance_s: float = 0.06):
             if g > 0:
                 # 전 구간 / 수렴 후(리셋 5 s 이후) 두 가지. 짧은 에피소드만 있으면 수렴 후 값은 비어 있다.
                 err_all = np.abs(rec["L_hat"] - rec["L"])[m]
-                row["L_mae_all_mm"] = float(np.median(err_all) * 1000)
+                row["L_err_median_all_mm"] = float(np.median(err_all) * 1000)
                 conv = m & (rec["t_reset"] > 5.0)
                 if conv.any():
                     err = np.abs(rec["L_hat"] - rec["L"])[conv]
-                    row["L_mae_mm"] = float(np.median(err) * 1000)
-                    row["L_mae90_mm"] = float(np.quantile(err, 0.9) * 1000)
+                    row["L_err_median_mm"] = float(np.median(err) * 1000)
+                    row["L_err_p90_mm"] = float(np.quantile(err, 0.9) * 1000)
             row["v_mae"] = float(rec["v_err"][m].mean())
         rows.append(row)
 
@@ -399,13 +399,13 @@ def print_tables(rows) -> None:
         log("\n" + "=" * 84)
         log("Phase 3 보조 헤드 (L̂ 는 부상 env 만; '수렴 후' = 리셋 5 s 이후 샘플)")
         log("=" * 84)
-        log(f"{'Group':<8} | {'L̂ MAE 전체 mm':>14} | {'수렴 후 median':>14} | {'수렴 후 90%':>12} | {'v̂ MAE m/s':>10}")
+        log(f"{'Group':<8} | {'|L̂−L| median 전체':>16} | {'수렴 후 median':>14} | {'수렴 후 p90':>12} | {'v̂ MAE m/s':>10}")
         log("-" * 84)
         for r in rows:
-            l0 = f"{r['L_mae_all_mm']:.1f}" if "L_mae_all_mm" in r else "-"
-            l1 = f"{r['L_mae_mm']:.1f}" if "L_mae_mm" in r else "-"
-            l2 = f"{r['L_mae90_mm']:.1f}" if "L_mae90_mm" in r else "-"
-            log(f"{r['group']:<8} | {l0:>14} | {l1:>14} | {l2:>12} | {r['v_mae']:>10.3f}")
+            l0 = f"{r['L_err_median_all_mm']:.1f}" if "L_err_median_all_mm" in r else "-"
+            l1 = f"{r['L_err_median_mm']:.1f}" if "L_err_median_mm" in r else "-"
+            l2 = f"{r['L_err_p90_mm']:.1f}" if "L_err_p90_mm" in r else "-"
+            log(f"{r['group']:<8} | {l0:>16} | {l1:>14} | {l2:>12} | {r['v_mae']:>10.3f}")
 
 
 def plot_gait(rows, path: Path) -> None:
@@ -468,7 +468,7 @@ def table_conditions(rows) -> list[dict]:
 
 def table_paradigm(rows) -> list[dict]:
     """논문 표 2 (paradigm). Antalgic 행: 부상 4조건의 부상 다리 지표 평균 ± 조건 간 s.d.
-    Healthy limb 행: Normal 그룹 다리별 범위; SI 는 좌우 동명 다리 쌍 기준 최대 |SI|.
+    Healthy limb 행: Normal 그룹 다리별 범위; SI 는 좌우 동명 다리 쌍(FL-FR, RL-RR) |SI| 평균 (표 1 과 동일).
       tracking_err            |v_cmd − v|_xy [m/s]
       peak_grf_n / peak_grf_bw 부상 다리 per-stance peak |Fz| [N] / [%BW]
       grf_red_pct             Normal 대비 감소율 [%]
@@ -501,8 +501,8 @@ def table_paradigm(rows) -> list[dict]:
         si_s = [si("stance_dur", "FL", "FR"), si("stance_dur", "RL", "RR")]
         out.append({"paradigm": "Healthy limb", "n_conditions": 1, "tracking_err": ref["vel_err_xy"],
                     "peak_grf_n_min": pk[0], "peak_grf_n_max": pk[1], "peak_grf_bw_min": pb[0], "peak_grf_bw_max": pb[1],
-                    "si_grf_pct_absmax": float(np.nanmax(np.abs(si_g))), "si_grf_pct_FLFR": si_g[0], "si_grf_pct_RLRR": si_g[1],
-                    "si_stance_pct_absmax": float(np.nanmax(np.abs(si_s))), "si_stance_pct_FLFR": si_s[0], "si_stance_pct_RLRR": si_s[1],
+                    "si_grf_pct_absmean": float(np.nanmean(np.abs(si_g))), "si_grf_pct_FLFR": si_g[0], "si_grf_pct_RLRR": si_g[1],
+                    "si_stance_pct_absmean": float(np.nanmean(np.abs(si_s))), "si_stance_pct_FLFR": si_s[0], "si_stance_pct_RLRR": si_s[1],
                     "dz_mm_min": dz[0], "dz_mm_max": dz[1]})
     return out
 
@@ -533,8 +533,8 @@ def print_tables_paper(t1: list[dict], t2: list[dict], fixed_x: float | None) ->
                 f"{f('si_grf_pct'):>10} | {f('si_stance_pct'):>10} | {f('dz_aff_mm'):>10} | {f('dz_contra_mm'):>10}")
         else:
             log(f"{r['paradigm']:<13} | {r['tracking_err']:>9.3f} | {r['peak_grf_n_min']:>4.0f}–{r['peak_grf_n_max']:<6.0f} | "
-                f"{r['peak_grf_bw_min']:>4.0f}–{r['peak_grf_bw_max']:<6.0f} | {'—':>8} | ±{r['si_grf_pct_absmax']:<9.1f} | "
-                f"±{r['si_stance_pct_absmax']:<9.1f} | {r['dz_mm_min']:>+4.1f}…{r['dz_mm_max']:<+5.1f} | {'—':>10}")
+                f"{r['peak_grf_bw_min']:>4.0f}–{r['peak_grf_bw_max']:<6.0f} | {'—':>8} | ±{r['si_grf_pct_absmean']:<9.1f} | "
+                f"±{r['si_stance_pct_absmean']:<9.1f} | {r['dz_mm_min']:>+4.1f}…{r['dz_mm_max']:<+5.1f} | {'—':>10}")
     log("-" * 96)
 
 
