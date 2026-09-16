@@ -43,7 +43,7 @@ train:
 
 checkpoint:
   mode: "warmstart"
-  teacher: ""
+  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P1-final/model_2999.pt"
   student: ""
   load_optimizer: false
   reset_iteration: false

@@ -1,8 +1,8 @@
 # Fault-tolerant 대조군 (pain ablation).
 #
-#   PYTHONPATH=/home/shw/go1_lod/source/go1_lab python3 train.py --phase 2 \
-#       --phase_config_path configs/phase/phase2_ft.yaml \
-#       --run_tag P2-fault-tolerant-001 --headless
+#   cd /home/shw/go1_lod/scripts/rsl_rl
+#   PYTHONPATH=/home/shw/go1_lod/source/go1_lab /home/shw/miniconda3/envs/isaac/bin/python train.py \
+#       --phase_config_path configs/phase/2/phase2_ft.yaml --run_tag P2-ft --headless
 
 train:
   project_name: unitree_go1_antalgic
@@ -42,7 +42,7 @@ train:
 
 checkpoint:
   mode: "warmstart"
-  teacher: ""
+  teacher: "/home/shw/go1_lod/scripts/rsl_rl/logs/unitree_go1_antalgic/P1-final/model_2999.pt"
   student: ""
   load_optimizer: false
   reset_iteration: false

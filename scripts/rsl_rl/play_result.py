@@ -5,28 +5,52 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """보행 지표 + (phase 3) 부목 길이·속도 추정 결과 추출. phase 1/2/3 공통.
-# 무작위 명령 (yaml 범위)
-play_result.py --phase_config_path configs/phase/3/phase3.yaml \
-  --checkpoint logs/unitree_go1_antalgic/P3-final/model_3999.pt --num_envs 40 --steps 1500 --headless
+cd /home/shw/go1_lod/scripts/rsl_rl
+export PYTHONPATH=/home/shw/go1_lod/source/go1_lab
 
-play_result.py --phase_config_path configs/phase/3/phase3.yaml \
-  --checkpoint logs/unitree_go1_antalgic/P3-final/model_3999.pt --num_envs 40 --steps 1500 --headless \
-  --fixed_x 0.5 --out_dir logs/unitree_go1_antalgic/P3-final/eval_fixed_x0.5
+# 표 1·2·3 (antalgic, 이미 뽑힘: P3-final/eval_x0.5_n200_s3000/)
+python play_result.py --phase_config_path configs/phase/3/phase3.yaml \
+  --checkpoint logs/unitree_go1_antalgic/P3-final/model_3999.pt \
+  --num_envs 200 --steps 3000 --fixed_x 0.5 --headless --label Antalgic \
+  --out_dir logs/unitree_go1_antalgic/P3-final/eval_x0.5_n200_s3000
+
+# 표 2 FT 행 (P2-ft 학습 완료 후, 최종 체크포인트 경로로)
+python play_result.py --phase_config_path configs/phase/2/phase2_ft.yaml \
+  --checkpoint logs/unitree_go1_antalgic/<P2-ft run>/model_7998.pt \
+  --num_envs 200 --steps 3000 --fixed_x 0.5 --headless --label FT \
+  --out_dir logs/unitree_go1_antalgic/<P2-ft run>/eval_x0.5_n200_s3000
+
+# 표 2 SYM 행
+python play_result.py --phase_config_path configs/phase/2/phase2_sym.yaml \
+  --checkpoint logs/unitree_go1_antalgic/<P2-sym run>/model_7998.pt \
+  --num_envs 200 --steps 3000 --fixed_x 0.5 --headless --label SYM \
+  --out_dir logs/unitree_go1_antalgic/<P2-sym run>/eval_x0.5_n200_s3000
+
+# 세 정책 합치기 → table_3paradigm.csv + LaTeX 행 출력
+python merge_paradigm_tables.py \
+  logs/unitree_go1_antalgic/P3-final/eval_x0.5_n200_s3000/table_paradigm.csv \
+  logs/unitree_go1_antalgic/<P2-ft run>/eval_x0.5_n200_s3000/table_paradigm.csv \
+  logs/unitree_go1_antalgic/<P2-sym run>/eval_x0.5_n200_s3000/table_paradigm.csv
 
 
 
+* 접지판정기준 업데이트함.
 접지 판정은 Isaac Lab ContactSensor 의 판정을 그대로 쓴다 (current_contact_time > 0, 즉
 ||F|| > ContactSensorCfg.force_threshold — 학습 보상(feet_air_time)과 같은 기준, 이 환경은 1 N).
 GRF/충격량은 수직력 |Fz| 로, 리셋 후 settle_s 이후의 완결된 stance(리셋 경계에 잘리지 않고
 min_stance_s 이상 지속) 단위로 계산한다. --fixed_x 0.5 를 주면 전진 명령을 고정한다.
+
 
 출력 (기본: 체크포인트 폴더):
   gait_analysis.png         조건별 다리별 duty factor / 접촉력
   grf_impulse_analysis.png  다리별 peak GRF / 부상 다리 GRF 감소율·SI / 역할별 충격량 변화율
   estimation_analysis.png   phase 3 만: L̂ 수렴 곡선, L̂ vs GT, v̂ 오차
   metrics_summary.csv       조건별 수치 요약
-  table_conditions.csv      논문 표 1: 조건별 survival / 전진 속도 / 부상 다리 GRF·감소율·duty / SI_GRF + Mean (injured)
-  table_paradigm.csv        논문 표 2: Antalgic 한 줄(부상 4조건 평균±s.d.) + Healthy limb 범위 한 줄
+  table_conditions.csv      논문 표 1 (tab:unified): 조건별 survival / 전진 속도 / 부상 다리 GRF·감소율·duty / SI_GRF / VI + Mean (injured)
+  table_paradigm.csv        논문 표 2 (tab:3paradigm): 이 정책 한 줄(부상 4조건 평균±s.d.) + Healthy limb 범위 한 줄.
+                            FT/SYM 도 같은 명령으로 뽑은 뒤 merge_paradigm_tables.py 로 합친다
+  table_animal.csv          논문 표 3 (tab:animal): 앞/뒤 girdle 별 부상 다리 GRF·충격량·stance 변화와 Δz
+  table_rows.tex            표 1·3 에 붙여 넣을 LaTeX 행 (표 2 행은 merge_paradigm_tables.py)
   rollout_raw.npz           --dump_npz 시 원자료
 """
 
@@ -55,6 +79,7 @@ parser.add_argument("--settle_s", type=float, default=2.0, help="GRF/Δz 통계�
 parser.add_argument("--min_stance_s", type=float, default=0.06, help="이보다 짧은 접지는 채터링으로 버린다 [s]")
 parser.add_argument("--fixed_x", type=float, default=None, help="전진 명령 고정 [m/s] (좌우 명령은 0)")
 parser.add_argument("--fixed_yaw", type=float, default=None, help="yaw 명령 고정 [rad/s]")
+parser.add_argument("--label", type=str, default=None, help="table_paradigm 의 행 이름. 미지정 시 env overrides.name (없으면 Antalgic)")
 parser.add_argument("--dump_npz", action="store_true", help="원자료(force, fz, contact, leg, t_reset, base_z, mg …)를 out_dir/rollout_raw.npz 로 저장 (오프라인 분석용)")
 AppLauncher.add_app_launcher_args(parser)
 args, _ = parser.parse_known_args()
@@ -209,7 +234,7 @@ def stance_stats(rec, settle_s: float, min_stance_s: float):
     dt = rec["dt"]
     settle = int(round(settle_s / dt))
     min_len = max(1, int(round(min_stance_s / dt)))
-    KEYS = ("peak", "peak_bw", "impulse", "dur", "dz")
+    KEYS = ("peak", "peak_bw", "impulse", "impulse_bw", "dur", "dz")
     acc = {g: {k: {key: [] for key in KEYS} for k in range(4)} for g in range(5)}
     for n in range(N):
         starts = np.flatnonzero(t_reset[:, n] == 0.0)
@@ -231,6 +256,7 @@ def stance_stats(rec, settle_s: float, min_stance_s: float):
                     acc[g][k]["peak"].append(float(seg.max()))
                     acc[g][k]["peak_bw"].append(float(seg.max() / mg[n] * 100.0))
                     acc[g][k]["impulse"].append(float(seg.sum() * dt))
+                    acc[g][k]["impulse_bw"].append(float(seg.sum() * dt / mg[n]))     # 체중 정규화 [BW·s]
                     acc[g][k]["dur"].append((b - a) * dt)
                     # 체간 상하 이동: 이 다리 stance 중 몸통 높이 − 에피소드 평균 (음수 = 내려앉음)
                     acc[g][k]["dz"].append(float(base_z[lo + a:lo + b, n].mean() - z_ref))
@@ -296,6 +322,7 @@ def summarize(rec, settle_s: float = 2.0, min_stance_s: float = 0.06):
             row[f"peak_grf_bw_{leg}"] = float(sg["peak_bw"][k]) if sg else float("nan")
             row[f"dz_{leg}_mm"] = float(sg["dz"][k]) * 1000.0 if sg else float("nan")
             row[f"impulse_{leg}"] = float(sg["impulse"][k]) if sg else float("nan")
+            row[f"impulse_bw_{leg}"] = float(sg["impulse_bw"][k]) if sg else float("nan")
             row[f"stance_dur_{leg}"] = float(sg["dur"][k]) if sg else float("nan")
             row[f"n_stance_{leg}"] = int(sg["n"][k]) if sg else 0
             row[f"load_{leg}"] = _nanmean(rec["fz"][..., k][ms])
@@ -331,6 +358,13 @@ def summarize(rec, settle_s: float = 2.0, min_stance_s: float = 0.06):
             r["duty_red_pct"] = -pct("duty", k)
             da, dc = r[f"stance_dur_{aff}"], r[f"stance_dur_{con}"]
             r["si_stance_pct"] = float(100.0 * (dc - da) / (0.5 * (dc + da))) if (dc + da) > 0 else float("nan")
+            ia, ic = r[f"impulse_{aff}"], r[f"impulse_{con}"]
+            r["si_impulse_pct"] = float(100.0 * (ic - ia) / (0.5 * (ic + ia))) if (ic + ia) > 0 else float("nan")
+            r["impulse_aff"] = ia                                          # 부상 다리 stance 당 수직 충격량 [N·s]
+            r["impulse_bw_aff"] = r[f"impulse_bw_{aff}"]                   # 같은 값, 체중 정규화 [BW·s]
+            r["impulse_red_pct"] = -pct("impulse", k)                      # Normal 같은 다리 대비 감소율 (+ = 감소)
+            r["stance_dur_aff"] = da
+            r["stance_dur_chg_pct"] = pct("stance_dur", k)                 # Normal 같은 다리 대비 변화율 (+ = 길어짐)
             r["peak_grf_aff_n"] = pa
             r["peak_grf_aff_bw"] = r[f"peak_grf_bw_{aff}"]
             r["dz_aff_mm"] = r[f"dz_{aff}_mm"]
@@ -448,6 +482,10 @@ def table_conditions(rows) -> list[dict]:
                 return abs(100.0 * (xb - xa) / (0.5 * (xa + xb))) if (xa + xb) > 0 else float("nan")
             out.append({"condition": "Healthy", "survival_pct": r["survival_pct"], "fwd_speed": r["fwd_speed"],
                         "fwd_cmd": r["fwd_cmd"], "injured_grf_n": float("nan"), "grf_red_pct": float("nan"),
+                        "injured_vi": float(np.mean([r[f"impulse_{l}"] for l in LEGS])),
+                        "injured_vi_bws": float(np.mean([r[f"impulse_bw_{l}"] for l in LEGS])), "vi_red_pct": float("nan"),
+                        "si_vi_pct": float(np.nanmean([abs(100.0 * (r[f"impulse_{b}"] - r[f"impulse_{a}"]) / (0.5 * (r[f"impulse_{a}"] + r[f"impulse_{b}"])))
+                                                       for a, b in (("FL", "FR"), ("RL", "RR"))])),
                         "injured_duty": float(np.mean([r[f"duty_{l}"] for l in LEGS])),
                         "si_grf_pct": float(np.nanmean([si("FL", "FR"), si("RL", "RR")])),
                         "episodes": r["episodes"]})
@@ -455,24 +493,27 @@ def table_conditions(rows) -> list[dict]:
             aff = LEGS[g - 1]
             d = {"condition": f"{r['group']} injury", "survival_pct": r["survival_pct"], "fwd_speed": r["fwd_speed"],
                  "fwd_cmd": r["fwd_cmd"], "injured_grf_n": r[f"peak_grf_{aff}"], "grf_red_pct": r["grf_red_pct"],
-                 "injured_duty": r[f"duty_{aff}"], "si_grf_pct": r["si_peak_grf_pct"], "episodes": r["episodes"]}
+                 "injured_duty": r[f"duty_{aff}"], "si_grf_pct": r["si_peak_grf_pct"],
+                 "injured_vi": r["impulse_aff"], "injured_vi_bws": r["impulse_bw_aff"], "vi_red_pct": r["impulse_red_pct"], "si_vi_pct": r["si_impulse_pct"],
+                 "episodes": r["episodes"]}
             out.append(d)
             inj.append(d)
     if inj:
         mean = {"condition": "Mean (injured)", "episodes": int(sum(d["episodes"] for d in inj))}
-        for k in ("survival_pct", "fwd_speed", "fwd_cmd", "injured_grf_n", "grf_red_pct", "injured_duty", "si_grf_pct"):
+        for k in ("survival_pct", "fwd_speed", "fwd_cmd", "injured_grf_n", "grf_red_pct", "injured_duty", "si_grf_pct",
+                  "injured_vi", "injured_vi_bws", "vi_red_pct", "si_vi_pct"):
             mean[k] = _nanmean([d[k] for d in inj])
         out.append(mean)
     return out
 
 
-def table_paradigm(rows) -> list[dict]:
+def table_paradigm(rows, label: str = "Antalgic") -> list[dict]:
     """논문 표 2 (paradigm). Antalgic 행: 부상 4조건의 부상 다리 지표 평균 ± 조건 간 s.d.
     Healthy limb 행: Normal 그룹 다리별 범위; SI 는 좌우 동명 다리 쌍(FL-FR, RL-RR) |SI| 평균 (표 1 과 동일).
       tracking_err            |v_cmd − v|_xy [m/s]
       peak_grf_n / peak_grf_bw 부상 다리 per-stance peak |Fz| [N] / [%BW]
       grf_red_pct             Normal 대비 감소율 [%]
-      si_grf_pct / si_stance_pct  peak GRF / stance 시간 대칭지수 (대측 − 부상)/평균 [%]
+      si_grf_pct / si_vi_pct / si_stance_pct  peak GRF / 수직 충격량 / stance 시간 대칭지수 (대측 − 부상)/평균 [%]
       dz_aff_mm / dz_contra_mm    부상측/대측 stance 중 몸통 높이 − 에피소드 평균 [mm]
     """
     inj = [r for r in rows if "grf_red_pct" in r]
@@ -480,9 +521,10 @@ def table_paradigm(rows) -> list[dict]:
     out = []
     if inj:
         keys = {"tracking_err": "vel_err_xy", "peak_grf_n": "peak_grf_aff_n", "peak_grf_bw": "peak_grf_aff_bw",
-                "grf_red_pct": "grf_red_pct", "si_grf_pct": "si_peak_grf_pct", "si_stance_pct": "si_stance_pct",
+                "grf_red_pct": "grf_red_pct", "si_grf_pct": "si_peak_grf_pct", "si_vi_pct": "si_impulse_pct",
+                "si_stance_pct": "si_stance_pct", "vi_red_pct": "impulse_red_pct",
                 "dz_aff_mm": "dz_aff_mm", "dz_contra_mm": "dz_contra_mm"}
-        row = {"paradigm": "Antalgic", "n_conditions": len(inj)}
+        row = {"paradigm": label, "n_conditions": len(inj)}
         for out_k, in_k in keys.items():
             v = np.array([r[in_k] for r in inj], float)
             row[out_k] = _nanmean(v)
@@ -499,7 +541,9 @@ def table_paradigm(rows) -> list[dict]:
         dz = rng([ref[f"dz_{l}_mm"] for l in LEGS])
         si_g = [si("peak_grf", "FL", "FR"), si("peak_grf", "RL", "RR")]
         si_s = [si("stance_dur", "FL", "FR"), si("stance_dur", "RL", "RR")]
+        si_v = [si("impulse", "FL", "FR"), si("impulse", "RL", "RR")]
         out.append({"paradigm": "Healthy limb", "n_conditions": 1, "tracking_err": ref["vel_err_xy"],
+                    "si_vi_pct_absmean": float(np.nanmean(np.abs(si_v))), "si_vi_pct_FLFR": si_v[0], "si_vi_pct_RLRR": si_v[1],
                     "peak_grf_n_min": pk[0], "peak_grf_n_max": pk[1], "peak_grf_bw_min": pb[0], "peak_grf_bw_max": pb[1],
                     "si_grf_pct_absmean": float(np.nanmean(np.abs(si_g))), "si_grf_pct_FLFR": si_g[0], "si_grf_pct_RLRR": si_g[1],
                     "si_stance_pct_absmean": float(np.nanmean(np.abs(si_s))), "si_stance_pct_FLFR": si_s[0], "si_stance_pct_RLRR": si_s[1],
@@ -507,35 +551,113 @@ def table_paradigm(rows) -> list[dict]:
     return out
 
 
-def print_tables_paper(t1: list[dict], t2: list[dict], fixed_x: float | None) -> None:
+def table_animal(rows) -> list[dict]:
+    """논문 표 3 (tab:animal). 앞(FL, FR)/뒤(RL, RR) girdle 별로 부상 다리 지표의 Normal 대비 변화.
+
+    각 열은 해당 girdle 두 조건의 min–max 범위와 평균. 변화율은 Normal 그룹의 같은 다리 기준.
+      grf_red_pct        peak GRF 감소율 (+ = 감소)
+      vi_red_pct         stance 당 수직 충격량 감소율 (+ = 감소)
+      stance_dur_chg_pct stance 지속시간 변화율 (+ = 길어짐)
+      duty_aff           부상 다리 duty (Normal 같은 다리 duty 는 duty_healthy)
+      dz_aff_mm / dz_contra_mm  부상측 / 대측 stance 중 몸통 높이 − 에피소드 평균
+    """
+    ref = next((r for r in rows if r["group"] == CONDITION_LABELS[0]), None)
+    out = []
+    for girdle, legs in (("fore", ("FL", "FR")), ("hind", ("RL", "RR"))):
+        grp = [r for r in rows if r["group"] in legs and "grf_red_pct" in r]
+        if not grp:
+            continue
+        row = {"girdle": girdle, "conditions": "+".join(r["group"] for r in grp)}
+        for key, src in (("grf_red_pct", "grf_red_pct"), ("vi_red_pct", "impulse_red_pct"),
+                         ("stance_dur_chg_pct", "stance_dur_chg_pct"), ("duty_aff", None),
+                         ("stance_dur_aff_s", "stance_dur_aff"), ("dz_aff_mm", "dz_aff_mm"), ("dz_contra_mm", "dz_contra_mm")):
+            vals = [r[f"duty_{r['group']}"] if src is None else r[src] for r in grp]
+            row[key + "_min"], row[key + "_max"], row[key] = float(np.nanmin(vals)), float(np.nanmax(vals)), _nanmean(vals)
+        if ref is not None:
+            row["duty_healthy"] = _nanmean([ref[f"duty_{l}"] for l in legs])
+            row["stance_dur_healthy_s"] = _nanmean([ref[f"stance_dur_{l}"] for l in legs])
+        out.append(row)
+    return out
+
+
+def print_tables_paper(t1: list[dict], t2: list[dict], t3: list[dict], fixed_x: float | None) -> None:
     log("\n" + "=" * 96)
     cmd_note = f"전진 명령 고정 {fixed_x} m/s" if fixed_x is not None else "전진 명령 샘플(v_x* > 0.1) 평균"
     log(f"Table 1 — per condition (Survival = time-out 종료 / 전체 종료; Fwd. speed = {cmd_note})")
     log("=" * 96)
-    log(f"{'Condition':<15} | {'Survival':>8} | {'Fwd speed':>9} | {'(cmd)':>6} | {'Inj GRF N':>9} | {'GRF red':>8} | {'Inj duty':>8} | {'SI_GRF %':>8} | {'episodes':>8}")
-    log("-" * 96)
+    log(f"{'Condition':<15} | {'Survival':>8} | {'Fwd speed':>9} | {'(cmd)':>6} | {'Inj GRF N':>9} | {'GRF red':>8} | {'Inj duty':>8} | {'SI_GRF %':>8} | "
+        f"{'Inj VI N·s':>10} | {'VI ×1e-2 s':>10} | {'VI red':>7} | {'SI_vi %':>7} | {'episodes':>8}")
+    log("-" * 120)
     for r in t1:
         grf = f"{r['injured_grf_n']:.1f}" if np.isfinite(r["injured_grf_n"]) else "—"
         red = f"{r['grf_red_pct']:.0f}%" if np.isfinite(r["grf_red_pct"]) else "—"
+        vred = f"{r['vi_red_pct']:.0f}%" if np.isfinite(r["vi_red_pct"]) else "—"
         log(f"{r['condition']:<15} | {r['survival_pct']:>7.1f}% | {r['fwd_speed']:>9.3f} | {r['fwd_cmd']:>6.2f} | {grf:>9} | {red:>8} | "
-            f"{r['injured_duty']:>8.2f} | {r['si_grf_pct']:>8.1f} | {r['episodes']:>8}")
-    log("-" * 96)
+            f"{r['injured_duty']:>8.2f} | {r['si_grf_pct']:>8.1f} | {r['injured_vi']:>10.2f} | {r['injured_vi_bws'] * 100:>10.2f} | {vred:>7} | {r['si_vi_pct']:>7.1f} | {r['episodes']:>8}")
+    log("-" * 120)
 
     log("\n" + "=" * 96)
     log("Table 2 — paradigm (Antalgic: 부상 4조건 평균 ± 조건 간 s.d. / Healthy limb: Normal 그룹 다리별 범위)")
     log("=" * 96)
-    log(f"{'Paradigm':<13} | {'track err':>9} | {'peak N':>11} | {'peak %BW':>11} | {'GRF red':>8} | {'SI_GRF':>10} | {'SI_st':>10} | {'dz aff':>10} | {'dz contra':>10}")
-    log("-" * 96)
+    log(f"{'Paradigm':<14} | {'track err':>9} | {'peak N':>11} | {'peak %BW':>11} | {'GRF red':>8} | {'SI_GRF':>10} | {'SI_vi':>10} | {'SI_st':>10} | {'dz aff':>9} | {'dz contra':>9}")
+    log("-" * 130)
     for r in t2:
-        if r["paradigm"] == "Antalgic":
+        if r["paradigm"] != "Healthy limb":
             f = lambda k, d=1: f"{r[k]:.{d}f}±{r[k + '_sd']:.{d}f}"
-            log(f"{r['paradigm']:<13} | {r['tracking_err']:>9.3f} | {f('peak_grf_n'):>11} | {f('peak_grf_bw'):>11} | {r['grf_red_pct']:>+7.0f}% | "
-                f"{f('si_grf_pct'):>10} | {f('si_stance_pct'):>10} | {f('dz_aff_mm'):>10} | {f('dz_contra_mm'):>10}")
+            log(f"{r['paradigm']:<14} | {r['tracking_err']:>9.3f} | {f('peak_grf_n'):>11} | {f('peak_grf_bw'):>11} | {r['grf_red_pct']:>+7.0f}% | "
+                f"{f('si_grf_pct'):>10} | {f('si_vi_pct'):>10} | {f('si_stance_pct'):>10} | {f('dz_aff_mm'):>9} | {f('dz_contra_mm'):>9}")
         else:
-            log(f"{r['paradigm']:<13} | {r['tracking_err']:>9.3f} | {r['peak_grf_n_min']:>4.0f}–{r['peak_grf_n_max']:<6.0f} | "
+            log(f"{r['paradigm']:<14} | {r['tracking_err']:>9.3f} | {r['peak_grf_n_min']:>4.0f}–{r['peak_grf_n_max']:<6.0f} | "
                 f"{r['peak_grf_bw_min']:>4.0f}–{r['peak_grf_bw_max']:<6.0f} | {'—':>8} | ±{r['si_grf_pct_absmean']:<9.1f} | "
-                f"±{r['si_stance_pct_absmean']:<9.1f} | {r['dz_mm_min']:>+4.1f}…{r['dz_mm_max']:<+5.1f} | {'—':>10}")
+                f"±{r['si_vi_pct_absmean']:<9.1f} | ±{r['si_stance_pct_absmean']:<9.1f} | {r['dz_mm_min']:>+3.1f}…{r['dz_mm_max']:<+5.1f} | {'—':>9}")
+    log("-" * 130)
+
+    log("\n" + "=" * 96)
+    log("Table 3 — animal comparison (girdle 별 부상 다리 변화, Normal 같은 다리 대비; 범위 = 두 조건 min–max)")
+    log("=" * 96)
+    log(f"{'girdle':<6} | {'peak GRF red':>14} | {'VI red':>14} | {'stance dur chg':>15} | {'duty aff (healthy)':>18} | {'dz aff / contra mm':>18}")
     log("-" * 96)
+    for r in t3:
+        log(f"{r['girdle']:<6} | {r['grf_red_pct_min']:>5.0f}–{r['grf_red_pct_max']:<5.0f}% | {r['vi_red_pct_min']:>5.0f}–{r['vi_red_pct_max']:<5.0f}% | "
+            f"{r['stance_dur_chg_pct_min']:>+5.0f}–{r['stance_dur_chg_pct_max']:<+5.0f}% | "
+            f"{r['duty_aff_min']:>4.2f}–{r['duty_aff_max']:<4.2f} ({r.get('duty_healthy', float('nan')):.2f}) | "
+            f"{r['dz_aff_mm']:>+6.1f} / {r['dz_contra_mm']:<+6.1f}")
+    log("-" * 96)
+
+
+def latex_rows(t1: list[dict], t2: list[dict], t3: list[dict], label: str) -> str:
+    """논문 표 1 (tab:unified) 과 표 3 (tab:animal) 에 붙여 넣을 LaTeX 행. 표 2 는 merge_paradigm_tables.py 가 만든다."""
+    L = []
+    L.append(f"% ---- tab:unified rows ({label}): Survival | Fwd speed | Injured GRF N | GRF red | Injured VI x1e-2 s | VI red | Injured duty | SI_GRF ----")
+    for r in t1:
+        if r["condition"] == "Mean (injured)":
+            continue
+        if r["condition"] == "Healthy":
+            L.append(f"Healthy   & {r['survival_pct']:.1f} & {r['fwd_speed']:.3f} & ---  & ---   & --- & --- & {r['injured_duty']:.2f} & {r['si_grf_pct']:.1f}  \\\\")
+            L.append(f"%   (healthy-limb VI, all legs: {r['injured_vi_bws'] * 100:.2f} x1e-2 s = {r['injured_vi']:.2f} N s)")
+        else:
+            L.append(f"{r['condition']:<9} & {r['survival_pct']:5.1f} & {r['fwd_speed']:.3f} & {r['injured_grf_n']:.1f} & {r['grf_red_pct']:.0f}\\%  "
+                     f"& {r['injured_vi_bws'] * 100:.2f} & {r['vi_red_pct']:.0f}\\% & {r['injured_duty']:.2f} & {r['si_grf_pct']:.1f} \\\\")
+    ant = next((r for r in t2 if r["paradigm"] != "Healthy limb"), None)
+    g = {r["girdle"]: r for r in t3}
+    if g:
+        arrow = lambda v: "$\\downarrow$" if v < 0 else "$\\uparrow$"
+        L.append(f"\n% ---- tab:animal 'Antalgic policy' column ({label}) ----")
+        for k in ("fore", "hind"):
+            r = g[k]
+            L.append(f"% Peak vertical GRF, affected ({k}):  {arrow(-r['grf_red_pct'])} ({r['grf_red_pct_min']:.0f}--{r['grf_red_pct_max']:.0f}\\%)")
+        for k in ("fore", "hind"):
+            r = g[k]
+            L.append(f"% Vertical impulse, affected ({k}):   {arrow(-r['vi_red_pct'])} ({r['vi_red_pct_min']:.0f}--{r['vi_red_pct_max']:.0f}\\%)")
+        for k in ("fore", "hind"):
+            r = g[k]
+            L.append(f"% Affected stance duration ({k}):     {arrow(r['stance_dur_chg_pct'])} (duty {r['duty_aff_min']:.2f}--{r['duty_aff_max']:.2f}; "
+                     f"stance time {r['stance_dur_chg_pct_min']:+.0f} to {r['stance_dur_chg_pct_max']:+.0f}\\% vs healthy)")
+        dz_txt = " ; ".join(f"{k}: $\\Delta z$ {g[k]['dz_aff_mm']:+.1f} / {g[k]['dz_contra_mm']:+.1f} mm" for k in ("fore", "hind"))
+        if ant:
+            dz_txt += f" ; pooled: ${ant['dz_aff_mm']:+.1f} \\pm {ant['dz_aff_mm_sd']:.1f}$ / ${ant['dz_contra_mm']:+.1f} \\pm {ant['dz_contra_mm_sd']:.1f}$ mm"
+        L.append(f"% Trunk drop, affected vs sound stance: {dz_txt}")
+    return "\n".join(L)
 
 
 def write_csv(path: Path, rows: list[dict], first: str) -> None:
@@ -718,11 +840,16 @@ def main() -> None:
         for r in rows:
             w.writerow({k: (f"{v:.5g}" if isinstance(v, float) else v) for k, v in r.items()})
     log(f"[INFO] 저장: {csv_path}")
-    t1, t2 = table_conditions(rows), table_paradigm(rows)
-    print_tables_paper(t1, t2, args.fixed_x)
+    label = args.label or str(config.environment.values.get("name") or "Antalgic")
+    t1, t2, t3 = table_conditions(rows), table_paradigm(rows, label), table_animal(rows)
+    print_tables_paper(t1, t2, t3, args.fixed_x)
     write_csv(out_dir / "table_conditions.csv", t1, "condition")
     write_csv(out_dir / "table_paradigm.csv", t2, "paradigm")
-    log(f"[INFO] 저장: {out_dir / 'table_conditions.csv'}, {out_dir / 'table_paradigm.csv'}")
+    write_csv(out_dir / "table_animal.csv", t3, "girdle")
+    tex = latex_rows(t1, t2, t3, label)
+    log("\n" + tex)
+    (out_dir / "table_rows.tex").write_text(tex + "\n", encoding="utf-8")
+    log(f"[INFO] 저장: {out_dir / 'table_conditions.csv'}, {out_dir / 'table_paradigm.csv'}, {out_dir / 'table_animal.csv'}")
     env.close()
 
 
